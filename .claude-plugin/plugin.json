@@ -1,0 +1,11 @@
+{
+  "name": "fee-hud",
+  "version": "0.1.0",
+  "description": "Adds a [Fee💰] line to the Claude Code statusLine showing token I/O, cache hit %, session cost, today cost, and weekly run-out estimate.",
+  "author": {
+    "name": "junwen_lu",
+    "email": "junwen_lu@foxitsoftware.com"
+  },
+  "homepage": "https://github.com/JunwenLu7777/Fee",
+  "license": "MIT"
+}
