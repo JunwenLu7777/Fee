@@ -76,8 +76,7 @@ function readSessionStats(transcriptPath) {
   if (!transcriptPath || !existsSync(transcriptPath)) return null;
   try {
     const text = readFileSync(transcriptPath, 'utf-8');
-    let inp = 0, out = 0, cacheRead = 0, cacheCreate = 0, cost = 0;
-    let hasUnknownModel = false;
+    let inp = 0, out = 0, cacheRead = 0, cacheCreate = 0;
     for (const line of text.split('\n')) {
       if (!line) continue;
       try {
@@ -93,15 +92,9 @@ function readSessionStats(transcriptPath) {
         out += to;
         cacheRead += tcr;
         cacheCreate += tcw;
-        const price = priceFor(obj.message?.model);
-        if (price) {
-          cost += (ti * price.in + to * price.out + tcr * price.cr + tcw * price.cw) / 1_000_000;
-        } else if (ti || to || tcr || tcw) {
-          hasUnknownModel = true;
-        }
       } catch { /* skip bad line */ }
     }
-    return { in: inp, out, cacheRead, cacheCreate, cost, hasUnknownModel };
+    return { in: inp, out, cacheRead, cacheCreate };
   } catch {
     return null;
   }
@@ -151,8 +144,11 @@ function buildFeeLine(sessionCtx) {
     tokIn = fmtNum(ss.in);  // 现在 ss.in 已经含 cache_creation + cache_read
     tokOut = fmtNum(ss.out);
     cacheHit = ss.in > 0 ? pct(ss.cacheRead / ss.in * 100) : '--';
-    sessionCost = fmtUsd(ss.cost) + (ss.hasUnknownModel ? '?' : '');
   }
+
+  // session 费用直接读 ccusage 当前 5h block 的 costUSD（避免自己维护价表）
+  const activeBlockCost = cache?.blocks?.blocks?.[0]?.costUSD;
+  if (typeof activeBlockCost === 'number') sessionCost = fmtUsd(activeBlockCost);
 
   const usage = readOmcUsage();
   const runOutMin = calcWeeklyRunOutMinutes(usage);
