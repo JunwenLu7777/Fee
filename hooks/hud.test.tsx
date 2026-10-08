@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentInfo, On, RenderElement, TurnUsage } from 'claude-code'
+import type { AgentInfo, On, RenderElement, TurnUsage, UiCopyResult } from 'claude-code'
 
 const BYPASS = '⏵⏵ bypass permissions on (shift+tab to cycle)'
 const HINT = { isDraft: false, isWorking: false, hint: BYPASS }
@@ -48,12 +48,25 @@ type World = {
   authKind?: 'bearer' | 'api-key' | null
   // 记下每次 http.fetch 的 URL
   fetched?: string[]
+  // 记下放进剪贴板的文字和弹出的提示；copyResult 是剪贴板的答复
+  copied?: string[]
+  toasts?: string[]
+  copyResult?: UiCopyResult
 }
 
 const world = (
   on: On,
   stored: Record<string, unknown> = {},
-  { isEngineHint = false, agents = [], usage = [usageBody(12)], authKind = 'bearer', fetched = [] }: World = {},
+  {
+    isEngineHint = false,
+    agents = [],
+    usage = [usageBody(12)],
+    authKind = 'bearer',
+    fetched = [],
+    copied = [],
+    toasts = [],
+    copyResult = { isCopied: true },
+  }: World = {},
 ) => {
   const clock = mock.clock(on, { now: NOW })
   on('session.authorize', () => ({ value: authKind ? { handle: 'cred-1', kind: authKind } : null }))
@@ -121,6 +134,18 @@ const world = (
 
     return <Text dimColor>{e.props.hint}</Text>
   })
+  // 代替引擎画一段回复，和真实会话里 next(e) 拿到的一样是引擎节点
+  on('ui.render', { component: 'AssistantMessage' }, () => ({ type: 'engine', ref: 0 }) as const)
+  on('ui.copy', ($, e) => {
+    copied.push(e.text)
+
+    return { value: copyResult }
+  })
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
 
   return clock
 }
@@ -163,10 +188,10 @@ const rowsOf = async ($: Engine, columns = 200, surface: 'terminal' | 'desktop' 
     : []
 }
 
-const complete = ($: Engine, turnId: string, agentId?: string) =>
+const complete = ($: Engine, turnId: string, { agentId, answer = '' }: { agentId?: string; answer?: string } = {}) =>
   $.turn.complete({
     turnId,
-    answer: '',
+    answer,
     durationMs: 1000,
     isAborted: false,
     reason: 'answer',
@@ -314,7 +339,7 @@ test('子 agent 跑完不会把主对话的本轮当成结束', async ($, on) =>
   world(on)
   await start($)
   await $.turn.start({ text: 'hi', turnId: 't1' })
-  await complete($, 's1', 'agent-1')
+  await complete($, 's1', { agentId: 'agent-1' })
 
   let [, , workspace] = await rowsOf($)
   expect(workspace).not.toContain('上轮')
@@ -450,4 +475,100 @@ test('关掉后下次启动仍保持关闭', async ($, on) => {
   world(on, { isHidden: true })
   await start($)
   expect(await isDrawn($)).toBe(false)
+})
+
+const mountReply = (
+  $: Engine,
+  text: string,
+  { isFullscreen = true, isSummary = false }: { isFullscreen?: boolean; isSummary?: boolean } = {},
+) =>
+  $.ui.mount({
+    plugin: 'hud',
+    surface: 'terminal',
+    component: 'AssistantMessage',
+    props: { text, isFirstOfReply: true, ...(isSummary ? { isSummary: true as const } : {}) },
+    viewport: { columns: 200, rows: 50, isFullscreen },
+  })
+
+// 画出来的树里的每个节点；悬停样式挂在元素上，不在 props 里
+type Drawn = { props?: Record<string, unknown>; hover?: unknown; children?: unknown[] }
+const nodesOf = (node: unknown): Drawn[] => {
+  const n = (node ?? {}) as Drawn
+
+  return [n, ...(Array.isArray(n.children) ? n.children.flatMap(nodesOf) : [])]
+}
+
+const hasCopy = async ($: Engine, text: string, options?: { isFullscreen?: boolean; isSummary?: boolean }) => {
+  const ui = await mountReply($, text, options)
+  const found = await ui.find({ type: 'Button', key: 'copy' })
+  await ui.unmount()
+
+  return found !== undefined
+}
+
+test('每轮最后那段回复下面有 copy，点了复制这段，按钮一会儿变成 ✓ copied 再变回来', async ($, on) => {
+  const copied: string[] = []
+  const toasts: string[] = []
+  const clock = world(on, {}, { copied, toasts })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await complete($, 't1', { answer: '## 结论\n\n能做。\n' })
+
+  const ui = await mountReply($, '## 结论\n\n能做。')
+  // 平时不变色；只有指到 copy 那一小块时，前面定宽的格子里才冒出 ❯
+  const button = await ui.find({ type: 'Button', key: 'copy' })
+  expect(button?.text).toBe('copy')
+  expect(button?.props.hover).toBeUndefined()
+  const hidden = nodesOf(await ui.drawn()).filter(n => n.props?.display === 'none')
+  expect(hidden.map(n => [n.hover, textOf(n as RenderElement)])).toEqual([[{ display: 'flex' }, '❯']])
+  // 点击要等 ✓ copied 换回来才算完，先不等它，拨着时钟看中间的样子
+  const pressing = ui.press({ key: 'copy' })
+  await clock.advance(1000)
+  expect(copied).toEqual(['## 结论\n\n能做。'])
+  expect(toasts).toEqual([])
+  expect(await ui.find({ type: 'Text', text: '✓ copied' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'copy' })).toBeUndefined()
+
+  await clock.advance(500)
+  await pressing
+  expect(await ui.find({ type: 'Text', text: '✓ copied' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'copy' })).toBeDefined()
+})
+
+test('回复先画出来，这轮结束时按钮跟着出现', async ($, on) => {
+  world(on)
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const ui = await mountReply($, '最终答案')
+  expect(await ui.find({ type: 'Button', key: 'copy' })).toBeUndefined()
+
+  await complete($, 't1', { answer: '最终答案' })
+  expect(await ui.find({ type: 'Button', key: 'copy' })).toBeDefined()
+})
+
+test('中间的进度说明、子 agent 的报告、主屏模式和折叠的摘要都不带复制按钮', async ($, on) => {
+  world(on)
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await complete($, 's1', { agentId: 'agent-1', answer: '子 agent 的报告' })
+  await complete($, 't1', { answer: '最终答案' })
+
+  expect(await hasCopy($, '最终答案')).toBe(true)
+  expect(await hasCopy($, '正在看代码')).toBe(false)
+  expect(await hasCopy($, '子 agent 的报告')).toBe(false)
+  expect(await hasCopy($, '最终答案', { isFullscreen: false })).toBe(false)
+  expect(await hasCopy($, '最终答案', { isSummary: true })).toBe(false)
+})
+
+test('剪贴板写不进去时提示原因', async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts, copyResult: { isCopied: false, reason: 'no-clipboard' } })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await complete($, 't1', { answer: '最终答案' })
+
+  const ui = await mountReply($, '最终答案')
+  await ui.press({ key: 'copy' })
+  expect(toasts).toEqual(['复制失败：no-clipboard'])
+  expect(await ui.find({ type: 'Text', text: '✓ copied' })).toBeUndefined()
 })

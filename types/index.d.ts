@@ -70,6 +70,10 @@ declare module 'claude-code' {
       turns: number | null
       version: string | null
       tzOffset: number | null
+      // 主对话每轮最后那段回复，按内容的哈希记；画回复时对得上的那段带复制按钮
+      answered: StateFamily<boolean>
+      // 每段回复上次点 copy 的时间，按画出来的那段回复记；刚点过的显示 ✓ copied
+      copiedAt: StateFamily<number | null>
     }
   }
 }

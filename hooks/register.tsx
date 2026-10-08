@@ -1,5 +1,5 @@
-import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionRateLimit, SessionUsage, TurnUsage } from 'claude-code'
+import { atom, memberOf, read, update } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit, SessionUsage, TurnUsage, UiPressArgument } from 'claude-code'
 
 import type { HudActivity, HudDiff, HudGit, HudLimit, HudStats, HudTodo, HudTokens } from '../types'
 
@@ -20,12 +20,15 @@ const turns = atom({ plugin: 'hud', key: 'turns' } as const, null)
 const version = atom({ plugin: 'hud', key: 'version' } as const, null)
 // 本地时区相对 UTC 的分钟数，插件环境里的 Date 不一定是本机时区，启动时问一次 date
 const tzOffset = atom({ plugin: 'hud', key: 'tzOffset' } as const, null)
+const answered = { plugin: 'hud', key: 'answered' } as const
+const copiedAt = atom({ plugin: 'hud', key: 'copiedAt' } as const, null)
 
 const HIDDEN_KEY = 'isHidden'
 // 引擎给插件的 rateLimits 只有 5h / 7d，Fable 的周额度得自己去 /usage 用的接口拿
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const FABLE_MIN_GAP_MS = 120_000
 const FABLE_EVERY_MS = 300_000
+const COPIED_MS = 1500
 // 这些工具跑完可能改了文件，跑完顺手刷新 git 状态
 const MUTATING_TOOLS = new Set(['Bash', 'Edit', 'Write', 'NotebookEdit'])
 const SPINNER = ['◐', '◓', '◑', '◒']
@@ -184,6 +187,17 @@ const toTodos = (raw: unknown): HudTodo[] =>
 
     return status ? [{ id: String(i), status, label: text(t.activeForm) ?? text(t.content) ?? '' }] : []
   })
+
+// FNV-1a 加上长度，只用来认出同一段回复
+const hashText = (s: string) => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+
+  return `${s.length}:${(h >>> 0).toString(36)}`
+}
 
 const shortDir = (cwd: string) => {
   if (/^\/(Users|home)\/[^/]+\/?$/.test(cwd)) {
@@ -912,6 +926,10 @@ export const register: Register = on => {
 
       return done
     }
+    const answer = e.answer.trim()
+    if (answer) {
+      await update($, { ...answered, id: hashText(answer) }, () => true)
+    }
     const at = await $.clock.now()
     await update($, activity, a =>
       a ? { ...a, isRunning: false, activeTool: null, elapsedMs: at - a.startedAt } : a,
@@ -941,6 +959,63 @@ export const register: Register = on => {
     await $.store.set(HIDDEN_KEY, hide)
 
     return { text: hide ? 'HUD 已关闭，输入 /hud 重新打开' : 'HUD 已打开' }
+  })
+
+  // 每轮回复的最后一段下面空一行画个暗色的 copy，点了把这段 markdown 放进剪贴板，和 /copy 走同一条路。
+  // 只在全屏终端画：主屏模式收不到点击，画了也按不动；中间的进度说明和折叠的摘要不带
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    const message = await next(e)
+    const text = e.props.text.trim()
+    if (e.surface !== 'terminal' || e.props.isSummary || e.viewport?.isFullscreen === false || !text) {
+      return message
+    }
+    if (!(await read($, { ...answered, id: hashText(text) }))) {
+      return message
+    }
+
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const flash = memberOf(copiedAt, e)
+    const isCopied = (await read($, flash)) != null
+    // 成功了按钮换成一会儿 ✓ copied 再换回来；连点时只有最后一次能换回来
+    const copy = async (press: UiPressArgument) => {
+      const done = await $.ui.copy({ text, surface: press.surface })
+      if (!done.isCopied) {
+        $.ui.toast(`复制失败：${done.reason}`, { timeoutMs: 3000 })
+
+        return
+      }
+      const at = await $.clock.now()
+      await update($, flash, () => at)
+      await $.clock.sleep(COPIED_MS)
+      await update($, flash, v => (v === at ? null : v))
+    }
+
+    // 和 PromptHint 一样，包着引擎节点的 Box 不能带 width。
+    // copy 前面留两格（正好对齐回复正文），鼠标指到这一小块时格子里冒出 ❯；
+    // 格子定宽，箭头出来不挤动 copy，回复其他地方指上去什么都不变
+    return (
+      <Box flexDirection="column">
+        {message}
+        <Box marginTop={1}>
+          {isCopied ? (
+            <Box marginLeft={2}>
+              <Text color="success">✓ copied</Text>
+            </Box>
+          ) : (
+            <Box key="copy-area">
+              <Box width={2}>
+                <Box display="none" hover={{ display: 'flex' }}>
+                  <Text>❯</Text>
+                </Box>
+              </Box>
+              <Button key="copy" plain dimColor onPress={copy}>
+                copy
+              </Button>
+            </Box>
+          )}
+        </Box>
+      </Box>
+    )
   })
 
   // 第一行照常是引擎自己的提示（⏵⏵ bypass permissions 等），HUD 另起两行（窄窗口三行）画在它下面

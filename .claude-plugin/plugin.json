@@ -1,6 +1,6 @@
 {
   "name": "hud",
   "version": "0.1.0",
-  "description": "输入框下方的自定义 HUD：模型、上下文、花费、限额、分支、本轮计时",
+  "description": "输入框下方的自定义 HUD：模型、上下文、花费、限额、分支、本轮计时；回复下方的复制按钮",
   "types": "./types/index.d.ts"
 }
