@@ -3,6 +3,7 @@ import type { Elements, RenderElement } from 'claude-code'
 import type {
   HudActivity,
   HudAgent,
+  HudDaily,
   HudDetailsTab,
   HudDetailsView,
   HudFileEdit,
@@ -16,8 +17,10 @@ import type {
   HudTurnSort,
 } from '../types'
 
-import { clip, formatElapsed, formatMs, formatTokens, formatUsd, padEnd, padStart } from './format'
-import { isLive } from './ledger'
+import { clip, dayKey, formatElapsed, formatMs, formatSpan, formatTokens, formatUsd, padEnd, padStart, weekdayOf } from './format'
+import { commandLabel, contextGrowth, isLive, sumLines } from './ledger'
+import type { CompactForecast } from './ledger'
+import { isUnpriced, lastDays, spentOn } from './spend'
 
 // 点 HUD 最前面的 ▸ 在 HUD 下方展开的明细，和每轮结尾那行下面的小票。
 // 这块在输入框下面，只能点不能打字：排序、翻页、选中、展开都是按钮
@@ -33,11 +36,6 @@ const join = (groups: Piece[][]) => groups.flatMap((g, i) => (i ? [SEP, ...g] : 
 // ---------- 每轮结尾那行下面的小票 ----------
 
 const baseName = (path: string) => path.split('/').pop() ?? path
-
-const sumLines = (files: readonly HudFileEdit[]) => ({
-  added: files.reduce((n, f) => n + f.added, 0),
-  removed: files.reduce((n, f) => n + f.removed, 0),
-})
 
 // 加的行绿色、删的行红色，和 git 一样
 const linesPieces = (added: number, removed: number): Piece[] =>
@@ -86,15 +84,34 @@ export type DetailsData = {
   stats: HudStats | null
   tokens: HudTokens | null
   now: number
+  // ccusage 算的每天花费；还没算过为 null
+  daily: HudDaily | null
+  // 照现在的速度重置前就会用完的额度，一条一句话
+  alerts: { text: string; isUrgent: boolean }[]
+  // 本地时区相对 UTC 的分钟数
+  offset: number
+  // 现在上下文有多少 token、到多少自动压缩、照最近几轮的涨法还能撑几轮
+  context: number | null
+  compactAt: number | null
+  compact: CompactForecast | null
 }
 
 // 点了什么就改一下明细的状态
 export type ChangeView = (change: (view: HudDetailsView) => HudDetailsView) => void
 
+export type DetailsActions = {
+  setView: ChangeView
+  // 点「刷新」马上重新用 ccusage 算每天花费
+  refreshDaily: () => void
+  // 点失败的命令，把它放进输入框
+  fillPrompt: (text: string) => void
+}
+
 const TABS: { id: HudDetailsTab; label: string }[] = [
   { id: 'turns', label: '轮次' },
   { id: 'tools', label: '工具耗时' },
   { id: 'agents', label: '子 agent' },
+  { id: 'spend', label: '每天花费' },
 ]
 
 // 三张卡片并排：轮次 62、工具耗时 60、子 agent 占剩下的（至少 36）；不够就改成点标签切换
@@ -109,6 +126,8 @@ export const SIDE_BY_SIDE_MIN = TURNS_WIDTH + TOOLS_WIDTH + AGENTS_MIN_WIDTH + C
 // 轮次多了才画趋势，两三轮看不出什么
 const TREND_MIN_TURNS = 5
 const BAR_WIDTH = 8
+// 轮次表多了一列 ctx，横条让出一格
+const TURN_BAR_WIDTH = 7
 const SPARKS = '▁▂▃▄▅▆▇█'
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 const FILES_SHOWN = 3
@@ -116,6 +135,8 @@ const FAILED_SHOWN = 2
 const SLOWEST_SHOWN = 5
 const REPORT_LINES = 6
 const PROMPT_LINES = 3
+// 每天花费列最近几天
+const DAYS_SHOWN = 7
 
 // 一串数画成一行小柱子，最高的那根顶格
 const sparkline = (values: readonly number[]) => {
@@ -176,11 +197,22 @@ type TurnRow = {
   tools: number
   reason: string | null
   receipt: HudReceipt
+  contextAtStart: number | null
+  contextAtEnd: number | null
+  isCompacted: boolean
 }
 
-const rowOfTurn = (t: HudTurn): TurnRow => ({ ...t, isRunning: false })
+// 热重载前记下的轮次没有上下文
+const rowOfTurn = (t: HudTurn): TurnRow => ({
+  ...t,
+  isRunning: false,
+  contextAtStart: t.contextAtStart ?? null,
+  contextAtEnd: t.contextAtEnd ?? null,
+  isCompacted: t.isCompacted ?? false,
+})
 
-const rowOfLive = (a: HudActivity): TurnRow => ({
+// 正在跑的这一轮，上下文涨到现在的
+const rowOfLive = (a: HudActivity, context: number | null): TurnRow => ({
   turnId: a.turnId,
   index: a.index,
   startedAt: a.startedAt,
@@ -189,7 +221,20 @@ const rowOfLive = (a: HudActivity): TurnRow => ({
   tools: a.tools,
   reason: null,
   receipt: a.receipt,
+  contextAtStart: a.contextAtStart ?? null,
+  contextAtEnd: context,
+  isCompacted: a.isCompacted ?? false,
 })
+
+// +12k；压缩过的写「压缩」
+const growthText = (r: TurnRow) => {
+  if (r.isCompacted) {
+    return '压缩'
+  }
+  const g = contextGrowth(r)
+
+  return g == null ? '-' : g >= 0 ? `+${formatTokens(g)}` : `-${formatTokens(-g)}`
+}
 
 const turnNo = (r: TurnRow) => (r.index != null ? `#${r.index}` : '#?')
 
@@ -199,6 +244,7 @@ const TURN_METRIC: Record<Exclude<HudTurnSort, 'recent'>, (r: TurnRow) => number
   cost: r => r.receipt.costUsd ?? 0,
   input: r => inputOf(r.receipt.tokens),
   output: r => r.receipt.tokens?.output ?? 0,
+  context: r => Math.max(0, contextGrowth(r) ?? 0),
 }
 
 const TOOL_METRIC: Record<HudToolSort, (s: HudToolStat) => number> = {
@@ -230,15 +276,34 @@ type Col<T, S> = {
 const align = (text: string, width: number, isRight?: boolean) =>
   isRight ? padStart(text, width) : padEnd(text, width)
 
+// 上下文 720k · 到 920k 自动压缩 · 每轮约 +40k · 约 5 轮后压缩
+const compactLine = (context: number, at: number, c: CompactForecast | null): Piece[] => [
+  { text: '上下文 ', dim: true },
+  { text: formatTokens(context) },
+  SEP,
+  { text: `到 ${formatTokens(at)} 自动压缩`, dim: true },
+  ...(c
+    ? [
+        SEP,
+        { text: `每轮约 +${formatTokens(Math.round(c.perTurn))}`, dim: true },
+        SEP,
+        {
+          text: c.turnsLeft === 0 ? '下一轮就可能压缩' : `约 ${c.turnsLeft} 轮后压缩`,
+          ...(c.turnsLeft <= 1 ? { color: 'red' } : c.turnsLeft <= 3 ? { color: 'yellow' } : {}),
+        },
+      ]
+    : []),
+]
+
 export const drawDetails = (
   ui: Ui,
   data: DetailsData,
   size: { columns: number; rows: number },
-  setView: ChangeView,
+  actions: DetailsActions,
 ): RenderElement => {
   const { Box, Text, Button } = ui
   const { view } = data
-  const patch = (next: Partial<HudDetailsView>) => setView(v => ({ ...v, ...next }))
+  const patch = (next: Partial<HudDetailsView>) => actions.setView(v => ({ ...v, ...next }))
   const paint = (p: Piece) => (
     <Text {...(p.color ? { color: p.color } : {})} {...(p.dim ? { dimColor: true } : {})}>
       {p.text}
@@ -310,7 +375,7 @@ export const drawDetails = (
   // ---------- 轮次 ----------
 
   const turnsBody = (width: number, rows: number) => {
-    const latest = [...(data.live ? [rowOfLive(data.live)] : []), ...data.turns.map(rowOfTurn).reverse()]
+    const latest = [...(data.live ? [rowOfLive(data.live, data.context)] : []), ...data.turns.map(rowOfTurn).reverse()]
     if (latest.length === 0) {
       return note('还没有跑完的轮次。')
     }
@@ -346,7 +411,13 @@ export const drawDetails = (
         cell: r => ({ text: r.receipt.costUsd != null ? formatUsd(r.receipt.costUsd) : '-' }),
       },
       ...(hasBar
-        ? [{ title: '', width: BAR_WIDTH, cell: (r: TurnRow) => ({ text: barOf(metric(r), maxMetric, BAR_WIDTH), color: 'yellow' }) }]
+        ? [
+            {
+              title: '',
+              width: TURN_BAR_WIDTH,
+              cell: (r: TurnRow) => ({ text: barOf(metric(r), maxMetric, TURN_BAR_WIDTH), color: 'yellow' }),
+            },
+          ]
         : []),
       ...(isWide
         ? [
@@ -364,6 +435,14 @@ export const drawDetails = (
               sort: 'output' as const,
               cell: (r: TurnRow) => ({ text: formatTokens(r.receipt.tokens?.output ?? 0) }),
             },
+            // 这一轮让上下文涨了多少
+            {
+              title: 'ctx',
+              width: 5,
+              isRight: true,
+              sort: 'context' as const,
+              cell: (r: TurnRow) => ({ text: growthText(r), ...(r.isCompacted ? { dim: true } : {}) }),
+            },
           ]
         : []),
       ...(hasBar
@@ -378,7 +457,7 @@ export const drawDetails = (
         : []),
       {
         title: '命令',
-        width: 6,
+        width: 5,
         isRight: true,
         cell: r => {
           const { commands, failed } = r.receipt
@@ -403,6 +482,7 @@ export const drawDetails = (
             ['缓存', cacheHit(data.tokens)],
           ]),
         )}
+        {data.context != null && data.compactAt != null && line(compactLine(data.context, data.compactAt, data.compact))}
         {recent.length >= TREND_MIN_TURNS &&
           line([
             { text: '趋势 ', dim: true },
@@ -451,6 +531,7 @@ export const drawDetails = (
             ['out', formatTokens(rec.tokens?.output ?? 0)],
             ['缓存', cacheHit(rec.tokens)],
             ['工具', `${r.tools} 次`],
+            ['上下文', r.isCompacted ? '压缩过' : growthText(r)],
             ...(rec.agents ? [['子 agent', `${rec.agents} 个`] as const] : []),
           ]),
         )}
@@ -460,8 +541,16 @@ export const drawDetails = (
           line([
             { text: `跑了 ${rec.commands} 条命令`, dim: true },
             ...(rec.failed ? [{ text: `，${rec.failed} 条失败`, color: 'red' }] : []),
+            ...(failed.length ? [{ text: '（点一条放进输入框）', dim: true }] : []),
           ])}
-        {failed.map(c => line([{ text: '  ✗ ', color: 'red' }, { text: clip(c, width - 4) }]))}
+        {failed.map((c, i) => (
+          <Box>
+            <Text color="red">{'  ✗ '}</Text>
+            <Button key={`fail:${i}`} plain onPress={() => actions.fillPrompt(c)}>
+              {clip(commandLabel(c), Math.max(8, width - 4))}
+            </Button>
+          </Box>
+        ))}
         {hidden > 0 && link('turn:more', `  … 展开全部（还有 ${hidden} 条）`, () => patch({ isTurnFull: true }))}
         {view.isTurnFull &&
           (rec.files.length > FILES_SHOWN || rec.failedCommands.length > FAILED_SHOWN) &&
@@ -623,29 +712,102 @@ export const drawDetails = (
     </Box>
   )
 
-  // 圆角框的卡片，标题加粗；没给宽度就占满剩下的
-  const card = (title: string | null, width: number | null, body: RenderElement) => (
+  // ---------- 每天花费 ----------
+
+  // 照现在的速度重置前就会用完的额度，写在每天花费最上面；返回画出来的内容和占几行
+  const spendBody = (width: number, rows: number): { body: RenderElement; height: number } => {
+    const alerts = data.alerts
+    const alertLines = alerts.map(a => <Text color={a.isUrgent ? 'red' : 'yellow'}>{a.text}</Text>)
+    const d = data.daily
+    if (!d || (d.days.length === 0 && d.fetchedAt == null)) {
+      const text =
+        d?.error === 'missing'
+          ? '没找到 ccusage，装上（npm i -g ccusage）就能看每天花了多少。'
+          : d?.error
+            ? `ccusage 没算成：${d.error}`
+            : '正在用 ccusage 算每天花了多少，第一次要几秒…'
+
+      return {
+        body: (
+          <Box flexDirection="column">
+            {alertLines}
+            {note(text)}
+            {d?.error && !d.isRunning && link('spend:refresh', '再试一次', actions.refreshDaily)}
+          </Box>
+        ),
+        height: alerts.length + 2,
+      }
+    }
+    const today = dayKey(data.now, data.offset)
+    const unpriced = isUnpriced(d.days)
+    const count = Math.max(3, Math.min(DAYS_SHOWN, rows - alerts.length - 2 - (unpriced ? 1 : 0)))
+    const dates = lastDays(today, count)
+    const costOf = new Map(d.days.map(x => [x.date, x.costUsd]))
+    const max = Math.max(0, ...dates.map(k => costOf.get(k) ?? 0))
+    const barWidth = Math.max(4, Math.min(24, width - 20))
+    const ago = d.fetchedAt == null ? '' : data.now - d.fetchedAt < 60_000 ? '刚刚算的' : `${formatSpan(data.now - d.fetchedAt)}前算的`
+
+    return {
+      body: (
+        <Box flexDirection="column">
+          {alertLines}
+          {line(
+            facts([
+              ['今天', formatUsd(spentOn(d.days, [today]))],
+              ['近 7 天', formatUsd(spentOn(d.days, lastDays(today, 7)))],
+              ['近 30 天', formatUsd(spentOn(d.days, lastDays(today, 30)))],
+            ]),
+          )}
+          {dates.map(k => {
+            const cost = costOf.get(k) ?? 0
+            const isToday = k === today
+
+            return line([
+              { text: `${k.slice(5).replace('-', '/')} ${weekdayOf(k)} `, ...(isToday ? {} : { dim: true }) },
+              { text: padEnd(barOf(cost, max, barWidth), barWidth), color: 'yellow' },
+              { text: ` ${padStart(cost ? formatUsd(cost) : '-', 8)}`, ...(cost ? {} : { dim: true }) },
+            ])
+          })}
+          {unpriced && note('有的天 ccusage 不认识模型的价格，记成了 $0，升级 ccusage 试试。')}
+          <Box columnGap={1}>
+            {note(['本机所有会话', 'ccusage', ago].filter(Boolean).join(' · '))}
+            {d.isRunning ? note('正在刷新…') : link('spend:refresh', '刷新', actions.refreshDaily)}
+          </Box>
+          {d.error && !d.isRunning && note(`上次刷新没成：${d.error === 'missing' ? '没找到 ccusage' : d.error}`)}
+        </Box>
+      ),
+      height: alerts.length + 2 + count + (unpriced ? 1 : 0) + (d.error ? 1 : 0),
+    }
+  }
+
+  // 圆角框的卡片，标题加粗；宽度给数字就定宽，grow 占满剩下的，fit 按内容
+  const card = (title: string | null, width: number | 'grow' | 'fit', body: RenderElement) => (
     <Box
       flexDirection="column"
       borderStyle="round"
       borderDimColor
       paddingX={1}
-      {...(width ? { width } : { flexGrow: 1 })}
+      {...(typeof width === 'number' ? { width } : width === 'grow' ? { flexGrow: 1 } : {})}
     >
       {title && <Text bold>{title}</Text>}
       {body}
     </Box>
   )
 
-  // 宽的时候三张卡片并排，一眼看完
+  // 宽的时候轮次、工具耗时并排，最右边一列上面是每天花费、下面是子 agent，一眼看完
   if (size.columns >= SIDE_BY_SIDE_MIN) {
     const rows = size.rows - 3
+    const sideWidth = size.columns - TURNS_WIDTH - TOOLS_WIDTH - CARD_GAP * 2 - CARD_CHROME
+    const spend = spendBody(sideWidth, rows - 4)
 
     return (
       <Box columnGap={CARD_GAP}>
         {card('轮次', TURNS_WIDTH, turnsBody(TURNS_WIDTH - CARD_CHROME, rows))}
         {card('工具耗时', TOOLS_WIDTH, toolsBody(TOOLS_WIDTH - CARD_CHROME, rows))}
-        {card('子 agent', null, agentsBody(size.columns - TURNS_WIDTH - TOOLS_WIDTH - CARD_GAP * 2 - CARD_CHROME, rows))}
+        <Box flexDirection="column" flexGrow={1}>
+          {card('每天花费', 'fit', spend.body)}
+          {card('子 agent', 'grow', agentsBody(sideWidth, Math.max(3, rows - spend.height - 3)))}
+        </Box>
       </Box>
     )
   }
@@ -669,12 +831,18 @@ export const drawDetails = (
     </Box>
   )
   const body =
-    tab.id === 'tools' ? toolsBody(width, rows) : tab.id === 'agents' ? agentsBody(width, rows) : turnsBody(width, rows)
+    tab.id === 'tools'
+      ? toolsBody(width, rows)
+      : tab.id === 'agents'
+        ? agentsBody(width, rows)
+        : tab.id === 'spend'
+          ? spendBody(width, rows).body
+          : turnsBody(width, rows)
 
   return (
     <Box flexDirection="column">
       {tabs}
-      {card(null, null, body)}
+      {card(null, 'grow', body)}
     </Box>
   )
 }

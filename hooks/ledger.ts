@@ -1,6 +1,17 @@
 import type { AgentInfo, TurnUsage } from 'claude-code'
 
-import type { HudActivity, HudAgent, HudDetailsView, HudDiff, HudReceipt, HudTokens, HudToolCall, HudToolStat, HudTurn } from '../types'
+import type {
+  HudActivity,
+  HudAgent,
+  HudDetailsView,
+  HudDiff,
+  HudFileEdit,
+  HudReceipt,
+  HudTokens,
+  HudToolCall,
+  HudToolStat,
+  HudTurn,
+} from '../types'
 
 import { clip } from './format'
 
@@ -13,8 +24,16 @@ const PROMPT_KEEP = 300
 const REPORT_KEEP = 800
 const FAILED_KEEP = 5
 const COMMAND_LABEL_MAX = 80
+// 失败的命令留原文，点了放进输入框；太长的截掉
+const FAILED_COMMAND_MAX = 1000
+// 估还能撑几轮时，看最近几轮上下文平均涨多少
+const GROWTH_SAMPLE = 5
 // 每轮结尾那行（✻ … for 3s）只带用时，和 turn.complete 报的可能差一点，差这么多以内都算同一轮
 const MATCH_TOLERANCE_MS = 2000
+
+// 同一条命令连着失败几次、同一个文件一轮里改了几次，到这个数就提醒一次「可能在原地打转」；嫌烦就调大
+export const LOOP_FAILS = 3
+export const LOOP_EDITS = 10
 
 export const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 export const SHELL_TOOLS = new Set(['Bash', 'PowerShell'])
@@ -86,6 +105,11 @@ export const costSince = (start: number | null, now: number | null) =>
 
 // ---------- 一轮的小票 ----------
 
+export const sumLines = (files: readonly HudFileEdit[]): HudDiff => ({
+  added: files.reduce((n, f) => n + f.added, 0),
+  removed: files.reduce((n, f) => n + f.removed, 0),
+})
+
 export const withEdit = (r: HudReceipt, path: string, counted: HudDiff | null): HudReceipt => {
   const added = counted?.added ?? 0
   const removed = counted?.removed ?? 0
@@ -100,7 +124,7 @@ export const withEdit = (r: HudReceipt, path: string, counted: HudDiff | null): 
 }
 
 // 命令只留第一行，太长截断
-const commandLabel = (command: string) => clip(command.trim().split('\n')[0] ?? '', COMMAND_LABEL_MAX)
+export const commandLabel = (command: string) => clip(command.trim().split('\n')[0] ?? '', COMMAND_LABEL_MAX)
 
 export const defaultView = (): HudDetailsView => ({
   tab: 'turns',
@@ -130,7 +154,9 @@ export const withCommand = (r: HudReceipt, command: string, failed: boolean): Hu
   ...r,
   commands: r.commands + 1,
   failed: r.failed + (failed ? 1 : 0),
-  failedCommands: failed ? [...r.failedCommands, commandLabel(command)].slice(-FAILED_KEEP) : r.failedCommands,
+  failedCommands: failed
+    ? [...r.failedCommands, command.trim().slice(0, FAILED_COMMAND_MAX)].slice(-FAILED_KEEP)
+    : r.failedCommands,
 })
 
 // 子 agent 的 token 也算进开它的那一轮；模型按主对话的记
@@ -140,10 +166,27 @@ export const withTokens = (r: HudReceipt, u: TurnUsage, isMain: boolean): HudRec
   model: isMain ? u.model : r.model,
 })
 
+// 按名字计数：命令失败一次、文件改一次就加一
+export const bump = (counts: Readonly<Record<string, number>>, key: string): Record<string, number> => ({
+  ...counts,
+  [key]: (counts[key] ?? 0) + 1,
+})
+
+// 命令成功了，它连着失败的次数从头数
+export const drop = (counts: Readonly<Record<string, number>>, key: string): Record<string, number> =>
+  Object.fromEntries(Object.entries(counts).filter(([k]) => k !== key))
+
 // ---------- 跑完的轮次 ----------
 
-// 花费先按现在的算，下一轮开始时再定下来（花费的读数可能比 turn.complete 晚到）
-export const toTurn = (a: HudActivity, durationMs: number, reason: string, cost: number | null): HudTurn => ({
+// 花费先按现在的算，下一轮开始时再定下来（花费的读数可能比 turn.complete 晚到）；上下文同理。
+// 热重载前开始的这一轮没有 contextAtStart / isCompacted
+export const toTurn = (
+  a: HudActivity,
+  durationMs: number,
+  reason: string,
+  cost: number | null,
+  context: number | null,
+): HudTurn => ({
   turnId: a.turnId,
   index: a.index,
   startedAt: a.startedAt,
@@ -152,6 +195,9 @@ export const toTurn = (a: HudActivity, durationMs: number, reason: string, cost:
   reason,
   costAtStart: a.costAtStart,
   receipt: { ...a.receipt, costUsd: costSince(a.costAtStart, cost) ?? a.receipt.costUsd },
+  contextAtStart: a.contextAtStart ?? null,
+  contextAtEnd: context,
+  isCompacted: a.isCompacted ?? false,
 })
 
 export const pushTurn = (log: readonly HudTurn[], turn: HudTurn): HudTurn[] => [...log, turn].slice(-TURN_LOG_MAX)
@@ -165,6 +211,52 @@ export const withLastCost = (log: HudTurn[], cost: number | null): HudTurn[] => 
   }
 
   return [...log.slice(0, -1), { ...last, receipt: { ...last.receipt, costUsd } }]
+}
+
+// 最后跑完的那一轮，上下文晚到的读数只往大了改：两轮之间手动 /compact 变小的不是这一轮的事
+export const withLastContext = (log: HudTurn[], context: number | null): HudTurn[] => {
+  const last = log.at(-1)
+  if (!last || context == null || last.isCompacted || (last.contextAtEnd != null && context <= last.contextAtEnd)) {
+    return log
+  }
+
+  return [...log.slice(0, -1), { ...last, contextAtEnd: context }]
+}
+
+// 这一轮让上下文涨了多少；压缩过、或者不知道的为 null
+export const contextGrowth = (t: Pick<HudTurn, 'contextAtStart' | 'contextAtEnd' | 'isCompacted'>) =>
+  !t.isCompacted && t.contextAtStart != null && t.contextAtEnd != null ? t.contextAtEnd - t.contextAtStart : null
+
+export type CompactForecast = {
+  // 还能完整跑几轮才到自动压缩；0 是下一轮就可能压缩
+  turnsLeft: number
+  // 最近几轮平均每轮涨多少
+  perTurn: number
+  // 拿了几轮来算
+  sample: number
+}
+
+// 照最近几轮上下文平均每轮涨多少，估还能撑几轮到自动压缩；不到两轮、或者上下文没在涨时不估
+export const compactForecast = (
+  log: readonly HudTurn[],
+  current: number | null,
+  compactAt: number | null,
+): CompactForecast | null => {
+  if (current == null || compactAt == null) {
+    return null
+  }
+  const growths = log.flatMap(t => {
+    const g = contextGrowth(t)
+
+    return g != null && g > 0 ? [g] : []
+  })
+  const recent = growths.slice(-GROWTH_SAMPLE)
+  if (recent.length < 2) {
+    return null
+  }
+  const perTurn = recent.reduce((n, g) => n + g, 0) / recent.length
+
+  return { turnsLeft: Math.max(0, Math.floor((compactAt - current) / perTurn)), perTurn, sample: recent.length }
 }
 
 // 先找用时一样的，再找差得最少的；一样近取后跑的那轮

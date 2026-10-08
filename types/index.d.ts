@@ -33,6 +33,14 @@ export type HudActivity = {
   costAtStart: number | null
   // 这一轮正在记的小票，跑完时存进 turnLog
   receipt: HudReceipt
+  // 主对话这一轮里每条命令连着失败了几次（成功一次就清掉）、每个文件改了几次，用来提醒原地打转
+  fails: Record<string, number>
+  edits: Record<string, number>
+  // 这一轮开始时工作区的 git 快照（树的 id）；不是 git 仓库时为 null，小票退回按 Edit / Write 算
+  treeAtStart: string | null
+  // 这一轮开始时上下文有多少 token；这一轮里有没有自动压缩过
+  contextAtStart: number | null
+  isCompacted: boolean
 }
 
 // 整个会话（含子 agent）累计的 token
@@ -43,7 +51,7 @@ export type HudTokens = {
   cacheWrite: number
 }
 
-// 本会话 Edit / Write 累计增删的行数
+// 本会话开始以来工作区净改的行数（git 快照对比）；不是 git 仓库时按 Edit / Write 累计
 export type HudDiff = {
   added: number
   removed: number
@@ -71,7 +79,7 @@ export type HudReceipt = {
   files: HudFileEdit[]
   commands: number
   failed: number
-  // 失败的命令，只留最后几条
+  // 失败的命令原文（截到一千字），只留最后几条；明细里点一条放进输入框
   failedCommands: string[]
   agents: number
 }
@@ -87,6 +95,10 @@ export type HudTurn = {
   reason: string
   costAtStart: number | null
   receipt: HudReceipt
+  // 这一轮开始、结束时上下文有多少 token，差就是这一轮让上下文涨了多少；压缩过的不算涨
+  contextAtStart: number | null
+  contextAtEnd: number | null
+  isCompacted: boolean
 }
 
 // 一种工具在本会话里的调用次数和耗时
@@ -128,10 +140,28 @@ export type HudAgent = {
   tokens: HudTokens | null
 }
 
-export type HudDetailsTab = 'turns' | 'tools' | 'agents'
+// ccusage 算的某一天：本机所有会话一共花了多少
+export type HudDay = {
+  // 本地日期，2026-10-08
+  date: string
+  costUsd: number
+  tokens: number
+}
+
+// 每天花费：ccusage 读本机所有会话的记录算的，最近 30 天
+export type HudDaily = {
+  days: HudDay[]
+  // 上次算好的时间；还没算好过为 null
+  fetchedAt: number | null
+  // 上次没算成的原因；missing 是没装 ccusage
+  error: string | null
+  isRunning: boolean
+}
+
+export type HudDetailsTab = 'turns' | 'tools' | 'agents' | 'spend'
 
 // 轮次按什么排：recent 最近的在前，其余按那一列从大到小
-export type HudTurnSort = 'recent' | 'duration' | 'cost' | 'input' | 'output'
+export type HudTurnSort = 'recent' | 'duration' | 'cost' | 'input' | 'output' | 'context'
 export type HudToolSort = 'total' | 'count' | 'avg' | 'max' | 'failed'
 
 // 明细里点出来的状态：看哪一页、按什么排、选中了谁、展开了谁
@@ -184,6 +214,13 @@ declare module 'claude-code' {
       // HUD 下方的明细展没展开，和展开后点出来的状态
       isExpanded: boolean
       detailsView: HudDetailsView
+      // 已经提醒过「照现在的速度会提前用完」的额度窗口：标签（5h / 7d / fable）→ 那个窗口的重置时间
+      warnedLimits: Record<string, number>
+      // 会话开始时工作区的 git 快照（树的 id），HUD 上的 +N -M 和它比
+      baseTree: string | null
+      daily: HudDaily | null
+      // 上下文到多少 token 时自动压缩；自动压缩关了或者还不知道为 null
+      compactAt: number | null
     }
   }
 }

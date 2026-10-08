@@ -97,3 +97,36 @@ export const formatSpan = (ms: number) => {
 }
 
 export const formatUsd = (usd: number) => `$${usd.toFixed(2)}`
+
+// ---------- 本地时间：插件环境里的 Date 不一定是本机时区，按启动时问到的偏移（分钟）自己算 ----------
+
+const pad2 = (n: number) => String(n).padStart(2, '0')
+
+const localDate = (at: number, offsetMinutes: number) => new Date(at + offsetMinutes * 60_000)
+
+// 15:40
+export const formatClock = (at: number, offsetMinutes: number) => {
+  const d = localDate(at, offsetMinutes)
+
+  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
+}
+
+// 2026-10-08，和 ccusage 按天分组用的一样
+export const dayKey = (at: number, offsetMinutes: number) => {
+  const d = localDate(at, offsetMinutes)
+
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`
+}
+
+const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六']
+
+// 2026-10-08 → 周四
+export const weekdayOf = (key: string) => `周${WEEKDAYS[new Date(`${key}T00:00:00Z`).getUTCDay()] ?? ''}`
+
+// 今天的只写钟点 15:40，别的天带上星期：周五 15:40
+export const formatWhen = (at: number, now: number, offsetMinutes: number) => {
+  const day = dayKey(at, offsetMinutes)
+  const clock = formatClock(at, offsetMinutes)
+
+  return day === dayKey(now, offsetMinutes) ? clock : `${weekdayOf(day)} ${clock}`
+}

@@ -3,6 +3,8 @@ import type { Engine } from 'claude-code/testing'
 import type { AgentInfo, On, RenderElement, TurnUsage, UiCopyResult } from 'claude-code'
 
 import { cellWidth, padEnd } from './format'
+import { parseNumstat } from './snapshot'
+import { withLastContext } from './ledger'
 
 const BYPASS = '⏵⏵ bypass permissions on (shift+tab to cycle)'
 const CWD = '/Users/me/code/engineering-kit'
@@ -57,7 +59,17 @@ type World = {
   copyResult?: UiCopyResult
   // session.usage 每次答的开始时间和花费；测试改它来模拟 /clear、/resume 换了会话
   session?: { startedAt: number; cost: number }
+  // 给了就当是 git 仓库：拍快照得到 tree（测试改它来模拟工作区变了），
+  // 两棵树的对比按「从..到」查 numstat，没有的当没改；不给就当不是 git 仓库
+  repo?: Repo
+  // ccusage daily --json 答的内容；不给就当没装 ccusage。每次跑都记进 ccusageRuns
+  ccusage?: string
+  ccusageRuns?: string[][]
+  // 自动压缩在上下文到多少 token 时触发；不给就当关着
+  compactAt?: number
 }
+
+type Repo = { tree: string; numstat: Record<string, string>; snapshots: number }
 
 // 当前测试的时钟拨 0 毫秒：等后台还没跑完的活（比如启动时拉 Fable 额度）都跑完
 let settle = async () => {}
@@ -75,6 +87,10 @@ const world = (
     toasts = [],
     copyResult = { isCopied: true },
     session = { startedAt: NOW - 42 * 60_000, cost: 1.23 },
+    repo,
+    ccusage,
+    ccusageRuns = [],
+    compactAt,
   }: World = {},
 ) => {
   const clock = mock.clock(on, { now: NOW })
@@ -91,16 +107,28 @@ const world = (
           : { status: 200, ok: true, headers: {}, text: body },
     }
   })
-  mock.store(on, stored)
+  // $.store 就是 stored 这个对象，测试改它来模拟别的会话存了东西
+  on('store.get', ($, e) => ({ value: stored[e.key] }))
+  on('store.set', ($, e) => {
+    stored[e.key] = e.value
+
+    return { value: undefined }
+  })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.cwd', () => ({ value: CWD }))
   on('settings.read', () => ({ value: { effortLevel: 'xhigh' } }))
-  on('session.usage', () => ({
+  on('session.usage', ($, e) => ({
     value: {
       startedAt: session.startedAt,
-      context: { tokens: 68_000, window: 200_000, percent: 34 },
+      context: {
+        tokens: 68_000,
+        window: 200_000,
+        percent: 34,
+        // 要了分类明细才带上自动压缩的点；测试只用得到这两项
+        ...(e.breakdown && compactAt ? { breakdown: { autoCompactThreshold: compactAt, isAutoCompactEnabled: true } as never } : {}),
+      },
       rateLimits: [
         { kind: 'five_hour', percentUsed: 23, resetsAt: new Date(NOW + 90 * 60_000).toISOString() },
         { kind: 'seven_day', percentUsed: 41, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
@@ -110,15 +138,37 @@ const world = (
   }))
   on('session.turns', () => ({ value: 12 }))
   on('session.version', () => ({ value: { version: '2.1.287', base: '2.1.287' } }))
-  on('process.run', ($, e) => ({
-    value: {
-      exitCode: 0,
-      stdout: e.argv[0] === 'date' ? '+0800\n' : GIT_STATUS,
-      stderr: '',
-      isStdoutTruncated: false,
-      isStderrTruncated: false,
-    },
-  }))
+  on('process.run', ($, e) => {
+    const answer = (exitCode: number, stdout: string) => ({
+      value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    })
+    if (e.argv[0] === 'date') {
+      return answer(0, '+0800\n')
+    }
+    if (e.argv.includes('ccusage')) {
+      ccusageRuns.push([...e.argv])
+
+      return ccusage === undefined
+        ? { value: { ...answer(127, '').value, stderr: 'nice: ccusage: No such file or directory' } }
+        : answer(0, ccusage)
+    }
+    // 给工作区拍快照
+    if (e.argv[0] === 'sh') {
+      if (!repo) {
+        return answer(1, '')
+      }
+      repo.snapshots += 1
+
+      return answer(0, `${CWD}\n${repo.tree}\n\n`)
+    }
+    if (e.argv[1] === 'diff') {
+      const [from, to] = e.argv.slice(-2)
+
+      return answer(0, repo?.numstat[`${from}..${to}`] ?? '')
+    }
+
+    return answer(0, GIT_STATUS)
+  })
   on('agent.list', () => ({ value: agents }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -256,16 +306,17 @@ test('两行放不下时先让掉本轮花费和 in/out，仍是两行', async (
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await $.session.measure({
     context: { tokens: 720_000, window: 1_000_000, percent: 72 },
+    // 照这个用法都撑得到重置，不带预测
     rateLimits: [
-      { kind: 'five_hour', percentUsed: 63, resetsAt: new Date(NOW + 165 * 60_000).toISOString() },
-      { kind: 'seven_day', percentUsed: 81, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
+      { kind: 'five_hour', percentUsed: 63, resetsAt: new Date(NOW + 45 * 60_000).toISOString() },
+      { kind: 'seven_day', percentUsed: 81, resetsAt: new Date(NOW + 86_400_000).toISOString() },
     ],
     cost: { usd: 1.5 },
     changed: ['context', 'rateLimits', 'cost'],
   })
   await complete($, 't1')
 
-  const head = '◆ Opus 5.5 1M · xhigh │ ctx ▰▰▰▰▰▰▰▱▱▱ 72% 720k/1M │ 5h ▰▰▰▱▱ 63% ↻2h45m · 7d ▰▰▰▰▱ 81% ↻3d · fable ▰▱▱▱▱ 12%'
+  const head = '◆ Opus 5.5 1M · xhigh │ ctx ▰▰▰▰▰▰▰▱▱▱ 72% 720k/1M │ 5h ▰▰▰▱▱ 63% ↻45m · 7d ▰▰▰▰▱ 81% ↻1d · fable ▰▱▱▱▱ 12%'
   expect((await rowsOf($, 200))[1]).toBe(`${head} │ in 10k · out 2.5k · cache 90% │ cost $1.50 (上轮 +0.27) · session 42m`)
   const narrower = await rowsOf($, 160)
   expect(narrower.length).toBe(3)
@@ -445,6 +496,58 @@ test('额度过了重置时间还没有新读数时按 0% 画，不再挂着旧�
   const [, resources] = await rowsOf($)
   expect(resources).toContain('5h 0% · fable')
   expect(resources).not.toContain('95%')
+})
+
+// 画出来的某一小段字是什么颜色
+const colorOf = async (ui: { drawn: () => Promise<RenderElement> }, text: string) =>
+  nodesOf(await ui.drawn()).find(n => n.children?.length === 1 && n.children[0] === text)?.props?.color
+
+// 只有 5 小时额度的读数：用了 percent，还有 minutes 分钟重置
+const fiveHour = (percent: number, minutes: number) => ({
+  context: { tokens: 68_000, window: 200_000, percent: 34 },
+  rateLimits: [{ kind: 'five_hour', percentUsed: percent, resetsAt: new Date(NOW + minutes * 60_000).toISOString() }],
+  cost: { usd: 1.23 },
+  changed: ['rateLimits' as const],
+})
+
+test('照这个窗口到现在的速度重置前就会用完时，额度后面写约几点用完，变黄，并弹一次提示', async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts })
+  await start($)
+  expect(toasts).toEqual([])
+
+  // 开始 2h15m 用了 63%，照这个速度 1h19m 后（本地 21:19）用完，22:45 才重置
+  await $.session.measure(fiveHour(63, 165))
+  expect((await rowsOf($))[1]).toContain('5h ▰▰▰▱▱ 63% ↻2h45m 约21:19用完 · fable')
+  expect(toasts).toEqual(['照现在的速度，5 小时额度约 21:19 用完（1h19m后），22:45 才重置'])
+  const ui = await mount($)
+  expect(await colorOf(ui, ' 约21:19用完')).toBe('yellow')
+  expect(await colorOf(ui, '63%')).toBe('yellow')
+  await ui.unmount()
+
+  // 同一个窗口里再有新读数也不再弹
+  await $.session.measure(fiveHour(66, 160))
+  expect(toasts).toHaveLength(1)
+})
+
+test('离用完不到半小时标红；窗口刚开始半小时内不预测', async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts })
+  await start($)
+
+  // 开始 20 分钟就用了 40%，太早，先不预测
+  await $.session.measure(fiveHour(40, 280))
+  expect((await rowsOf($))[1]).not.toContain('用完')
+  expect(toasts).toEqual([])
+
+  // 开始 1 小时用了 75%：20 分钟后就用完，百分比虽然没到 80% 也标红
+  await $.session.measure(fiveHour(75, 240))
+  expect((await rowsOf($))[1]).toContain('5h ▰▰▰▰▱ 75% ↻4h 约20:20用完')
+  const ui = await mount($)
+  expect(await colorOf(ui, ' 约20:20用完')).toBe('red')
+  expect(await colorOf(ui, '75%')).toBe('red')
+  await ui.unmount()
+  expect(toasts).toEqual(['照现在的速度，5 小时额度约 20:20 用完（20m后），周六 00:00 才重置'])
 })
 
 test('接近 1M 的 token 数显示成 1M，不是 1000k', async ($, on) => {
@@ -805,7 +908,7 @@ test('点 HUD 前面的 ▸ 在下方展开明细，变成 ▾，再点收起；
   expect(text).toContain('本会话 $1.50 · 2 轮 · in 30k · out 7.5k · 缓存 90%')
   // 只有两轮，不画趋势；每轮后面一根横条，花得最多的那轮最长
   expect(text).not.toContain('趋势')
-  expect(text).toMatch(/❯ #12\s+1s\s+\$0\.27 █{8}\s+10k\s+2\.5k\s+1\s+2 ✗1/)
+  expect(text).toMatch(/❯ #12\s+1s\s+\$0\.27 █{7}\s+10k\s+2\.5k\s+\+12k\s+1\s+2 ✗1/)
   expect(text).toContain('#12 · 1s · $0.27')
   expect(text).toMatch(/src\/a\.ts\s+\+2 -1/)
   expect(text).toContain('跑了 2 条命令，1 条失败')
@@ -894,6 +997,418 @@ test('/clear 之后明细也清空', async ($, on) => {
   expect(text).toContain('还没有跑完的轮次')
   expect(text).toContain('还没有工具调用')
   expect(text).toContain('这次会话还没有子 agent')
+})
+
+// ---------- git 快照对比改动行数 ----------
+
+const TREE_A = 'a'.repeat(40)
+const TREE_B = 'b'.repeat(40)
+const TREE_C = 'c'.repeat(40)
+
+test('git 仓库里小票按这一轮前后两张快照比：Bash 生成的文件也算，同一处改两次只算最后的结果', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  world(on, {}, { repo })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  // Edit 每次自己报 +2 -1，两次加起来是 +4 -2；实际同一处改了两次，净改 +2 -1
+  await $.tool.call({ tool: 'Edit', file_path: `${CWD}/src/a.ts`, old_string: 'b', new_string: 'c\nd' })
+  await $.tool.call({ tool: 'Edit', file_path: `${CWD}/src/a.ts`, old_string: 'c\nd', new_string: 'e\nf' })
+  repo.tree = TREE_B
+  repo.numstat[`${TREE_A}..${TREE_B}`] = '2\t1\tsrc/a.ts\0' + '3\t0\tscripts/gen.sh\0'
+  await $.tool.call({ tool: 'Bash', command: 'sh make-gen.sh' })
+  await complete($, 't1')
+
+  expect(await footerOf($, 1000)).toEqual(['✻ Baked for 1000ms', '  ⎿  改 a.ts、gen.sh +5 -1 · 1 条命令'])
+  // HUD 上的 +N -M 是会话开始以来净改的
+  expect((await rowsOf($))[2]).toContain('+5 -1')
+})
+
+test('HUD 上的 +N -M 从会话开始算，/clear 之后重新拍一张从头比', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  world(on, {}, { repo })
+  on('command.run', { command: 'clear' }, () => ({ text: '' }))
+  await start($)
+  expect(repo.snapshots).toBe(1)
+
+  // 你自己在两轮之间改的也算进会话的改动
+  repo.tree = TREE_B
+  repo.numstat[`${TREE_A}..${TREE_B}`] = '7\t0\tnotes.md\0'
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  repo.tree = TREE_C
+  repo.numstat[`${TREE_A}..${TREE_C}`] = '7\t0\tnotes.md\0' + '1\t1\tsrc/a.ts\0'
+  repo.numstat[`${TREE_B}..${TREE_C}`] = '1\t1\tsrc/a.ts\0'
+  await $.tool.call({ tool: 'Bash', command: "sed -i '' s/b/c/ src/a.ts" })
+  await complete($, 't1')
+  expect((await rowsOf($))[2]).toContain('+8 -1')
+  // 这一轮的小票只算这一轮的
+  expect(await footerOf($, 1000)).toEqual(['✻ Baked for 1000ms', '  ⎿  改 a.ts +1 -1 · 1 条命令'])
+
+  await $.command.run({
+    command: 'clear',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 200 },
+  })
+  await settle()
+  expect((await rowsOf($))[2]).not.toContain('+8 -1')
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await settle()
+  expect((await rowsOf($))[2]).not.toMatch(/\+\d+ -\d+/)
+})
+
+test('numstat 里改了名的、二进制的、会话目录外的文件都认得', async () => {
+  const out = '1\t2\thooks/a.ts\0' + '3\t3\t\0hooks/old.ts\0hooks/new.ts\0' + '-\t-\tassets/logo.png\0'
+  expect(parseNumstat(out, 'hooks/')).toEqual([
+    { path: 'a.ts', added: 1, removed: 2 },
+    { path: 'new.ts', added: 3, removed: 3 },
+    { path: '../assets/logo.png', added: 0, removed: 0 },
+  ])
+})
+
+// ---------- 每天花费 ----------
+
+// NOW 是本地 10 月 2 日（周五）20:00
+const DAILY = JSON.stringify({
+  daily: [
+    { date: '2026-09-01', totalCost: 5, totalTokens: 1000 },
+    { date: '2026-09-20', totalCost: 10, totalTokens: 1000 },
+    { date: '2026-09-30', totalCost: 40, totalTokens: 1000 },
+    { date: '2026-10-01', totalCost: 20, totalTokens: 1000 },
+    { date: '2026-10-02', totalCost: 80, totalTokens: 1000 },
+  ],
+  totals: {},
+})
+
+const spendTab = async ($: Engine) => {
+  const ui = await expand($, 120)
+  await ui.press({ key: 'tab:spend' })
+
+  return ui
+}
+
+test('每天花费：今天、近 7 天、近 30 天，最近 7 天每天一根横条，今天在最上面', async ($, on) => {
+  const ccusageRuns: string[][] = []
+  world(on, {}, { ccusage: DAILY, ccusageRuns })
+  await start($)
+  // 降低优先级跑，只算最近 30 天
+  expect(ccusageRuns).toEqual([['nice', '-n', '10', 'ccusage', 'daily', '--json', '--since', '20260903']])
+
+  const text = await hudText(await spendTab($))
+  expect(text).toContain('今天 $80.00 · 近 7 天 $140.00 · 近 30 天 $150.00')
+  const days = text.split('\n').filter(l => /\d\d\/\d\d 周/.test(l))
+  expect(days.map(l => l.replace(/│/g, '').trim().replace(/\s+/g, ' '))).toEqual([
+    '10/02 周五 ████████████████████████ $80.00',
+    '10/01 周四 ██████ $20.00',
+    '09/30 周三 ████████████ $40.00',
+    '09/29 周二 -',
+    '09/28 周一 -',
+    '09/27 周日 -',
+    '09/26 周六 -',
+  ])
+  expect(text).toContain('本机所有会话 · ccusage · 刚刚算的 刷新')
+})
+
+test('没装 ccusage 时告诉你怎么装', async ($, on) => {
+  world(on)
+  await start($)
+
+  expect(await hudText(await spendTab($))).toContain('没找到 ccusage，装上（npm i -g ccusage）就能看每天花了多少。')
+})
+
+test('15 分钟内不重复算，展开、跑完一轮都不算；点「刷新」马上重算', async ($, on) => {
+  const ccusageRuns: string[][] = []
+  const clock = world(on, {}, { ccusage: DAILY, ccusageRuns })
+  await start($)
+  const ui = await spendTab($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await complete($, 't1')
+  expect(ccusageRuns).toHaveLength(1)
+
+  await clock.advance(15 * 60_000)
+  await $.turn.start({ text: 'hi', turnId: 't2' })
+  await complete($, 't2')
+  await settle()
+  expect(ccusageRuns).toHaveLength(2)
+
+  await ui.press({ key: 'spend:refresh' })
+  expect(ccusageRuns).toHaveLength(3)
+})
+
+test('上一次算的存下来，下次启动先画上，没过 15 分钟不重算', async ($, on) => {
+  const ccusageRuns: string[][] = []
+  const days = [{ date: '2026-10-02', costUsd: 12.5, tokens: 100 }]
+  world(on, { daily: { days, fetchedAt: NOW - 5 * 60_000 } }, { ccusage: DAILY, ccusageRuns })
+  await start($)
+  expect(ccusageRuns).toEqual([])
+
+  const text = await hudText(await spendTab($))
+  expect(text).toContain('今天 $12.50')
+  expect(text).toContain('ccusage · 5m前算的')
+})
+
+test('同时开着别的会话、它刚算过时直接用它存下的，不再跑 ccusage', async ($, on) => {
+  const ccusageRuns: string[][] = []
+  const stored: Record<string, unknown> = {}
+  const clock = world(on, stored, { ccusage: DAILY, ccusageRuns })
+  await start($)
+  expect(ccusageRuns).toHaveLength(1)
+
+  // 过了 20 分钟，别的会话 2 分钟前刚算过一次存了下来
+  await clock.advance(20 * 60_000)
+  stored.daily = { days: [{ date: '2026-10-02', costUsd: 99, tokens: 1 }], fetchedAt: NOW + 18 * 60_000 }
+  const text = await hudText(await spendTab($))
+  expect(ccusageRuns).toHaveLength(1)
+  expect(text).toContain('今天 $99.00')
+  expect(text).toContain('2m前算的')
+})
+
+test('宽窗口最右边一列上面是每天花费、下面是子 agent；额度要提前用完时写在每天花费最上面', async ($, on) => {
+  world(on, {}, { ccusage: DAILY })
+  await start($)
+  await turnWithAgent($)
+  await $.session.measure(fiveHour(63, 165))
+
+  const text = await hudText(await expand($, 200))
+  expect(text).toContain('每天花费')
+  expect(text).toContain('照现在的速度，5 小时额度约 21:19 用完（1h19m后），22:45 才重置')
+  expect(text).toContain('今天 $80.00')
+  expect(text).toContain('✓ Explore · 找 diff 代码')
+  expect(text.indexOf('每天花费')).toBeLessThan(text.indexOf('✓ Explore'))
+})
+
+// ---------- 上下文还能撑几轮 ----------
+
+// 跑一轮，跑完时上下文是 tokens
+const turnTo = async ($: Engine, id: string, tokens: number) => {
+  await $.turn.start({ text: 'hi', turnId: id })
+  await $.session.measure({
+    context: { tokens, window: 200_000, percent: Math.round(tokens / 2000) },
+    rateLimits: [],
+    cost: { usd: 1.23 },
+    changed: ['context'],
+  })
+  await complete($, id)
+}
+
+test('照最近几轮上下文的涨法，ctx 后面写约几轮后自动压缩；明细里每轮多一列 ctx，能按它排', async ($, on) => {
+  world(on, {}, { compactAt: 200_000 })
+  await start($)
+  // 开始时 68k；只跑了一轮还不估
+  await turnTo($, 'a', 100_000)
+  expect((await rowsOf($))[1]).not.toContain('压缩')
+
+  // 两轮各涨 +32k、+20k，平均 +26k；离 200k 还差 80k，约 3 轮
+  await turnTo($, 'b', 120_000)
+  expect((await rowsOf($))[1]).toContain('ctx ▰▰▰▰▰▰▱▱▱▱ 60% 120k/200k 约3轮后压缩')
+  const ui = await mount($)
+  expect(await colorOf(ui, ' 约3轮后压缩')).toBe('yellow')
+  await ui.unmount()
+
+  const details = await expand($, 120)
+  let text = await hudText(details)
+  expect(text).toContain('上下文 120k · 到 200k 自动压缩 · 每轮约 +26k · 约 3 轮后压缩')
+  expect(text).toMatch(/❯ #12 .*\+20k/)
+  expect(text).toContain('上下文 +20k')
+  await details.press({ key: 'sort-turn:context' })
+  text = await hudText(details)
+  expect(text).toContain('ctx↓')
+  expect(text.indexOf('+32k')).toBeLessThan(text.indexOf('+20k'))
+})
+
+test('这一轮里自动压缩过的写「压缩」，估还能撑几轮时不算它', async ($, on) => {
+  world(on, {}, { compactAt: 200_000 })
+  // 代替引擎压缩：整段对话换成一条摘要
+  on('session.compact', () => ({ messages: [{ role: 'user' as const, text: '摘要', toolUses: [] }] }))
+  await start($)
+  await turnTo($, 'a', 100_000)
+  await turnTo($, 'b', 120_000)
+  await $.turn.start({ text: 'hi', turnId: 'c' })
+  await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'hi', toolUses: [] }] })
+  await $.session.measure({
+    context: { tokens: 30_000, window: 200_000, percent: 15 },
+    rateLimits: [],
+    cost: { usd: 1.23 },
+    changed: ['context'],
+  })
+  await complete($, 'c')
+
+  const text = await hudText(await expand($, 120))
+  expect(text).toMatch(/❯ #12 .*压缩/)
+  expect(text).toContain('上下文 压缩过')
+  // 还是按 +32k、+20k 平均 +26k 算：离 200k 还差 170k，约 6 轮
+  expect(text).toContain('上下文 30k · 到 200k 自动压缩 · 每轮约 +26k · 约 6 轮后压缩')
+  expect((await rowsOf($))[1]).toContain('15% 30k/200k 约6轮后压缩')
+})
+
+test('两轮之间晚到的上下文读数算到上一轮，只往大了改：手动 /compact 变小的不算', async () => {
+  const turn = {
+    turnId: 't',
+    index: 1,
+    startedAt: 0,
+    durationMs: 1000,
+    tools: 0,
+    reason: 'answer',
+    costAtStart: null,
+    receipt: { costUsd: null, tokens: null, model: null, files: [], commands: 0, failed: 0, failedCommands: [], agents: 0 },
+    contextAtStart: 50_000,
+    contextAtEnd: 60_000,
+    isCompacted: false,
+  }
+  expect(withLastContext([turn], 64_000)[0]?.contextAtEnd).toBe(64_000)
+  expect(withLastContext([turn], 20_000)[0]?.contextAtEnd).toBe(60_000)
+})
+
+// ---------- /config 里的门槛 ----------
+
+test(
+  '/config 里改了门槛：同一条命令失败 2 次就提醒，额度不弹提示（HUD 照写），不写压缩',
+  { options: { loopFails: 2, limitAlert: false, compactTurns: 0 } },
+  async ($, on) => {
+    const toasts: string[] = []
+    world(on, {}, { toasts, compactAt: 200_000 })
+    await start($)
+    await $.session.measure(fiveHour(63, 165))
+    expect((await rowsOf($))[1]).toContain('63% ↻2h45m 约21:19用完')
+    expect(toasts).toEqual([])
+
+    await turnTo($, 'a', 100_000)
+    await turnTo($, 'b', 120_000)
+    expect((await rowsOf($))[1]).not.toContain('压缩')
+
+    await $.turn.start({ text: 'hi', turnId: 't' })
+    await $.tool.call({ tool: 'Bash', command: 'false x' })
+    await $.tool.call({ tool: 'Bash', command: 'false x' })
+    expect(toasts).toEqual(['同一条命令连着失败 2 次了，可能在原地打转：false x'])
+    await settle()
+  },
+)
+
+test('/config 里把额度预测的起点调到窗口过一半：过了 45% 还不预测', { options: { forecastAfter: 50 } }, async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts })
+  await start($)
+  await $.session.measure(fiveHour(63, 165))
+  expect((await rowsOf($))[1]).not.toContain('用完')
+  expect(toasts).toEqual([])
+})
+
+// ---------- 点失败的命令放进输入框 ----------
+
+test('点小票明细里失败的命令，原文放进输入框；已经打了字就另起一行接在后面', async ($, on) => {
+  const filled: { text: string; mode: string }[] = []
+  const toasts: string[] = []
+  let draft = ''
+  let isFilled = true
+  world(on, {}, { toasts })
+  on('prompt.read', () => ({
+    value: { text: draft, cursor: draft.length, model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'] },
+  }))
+  on('prompt.fill', ($, e) => {
+    filled.push({ text: e.text, mode: e.mode })
+
+    return isFilled ? { isFilled: true } : { isFilled: false, refusal: 'dialog' as const }
+  })
+  await start($)
+  const command = 'false && npm test -- --grep "很长的名字"\necho 第二行'
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command })
+  await complete($, 't1')
+
+  const ui = await expand($, 120)
+  const text = await hudText(ui)
+  expect(text).toContain('跑了 1 条命令，1 条失败（点一条放进输入框）')
+  // 明细里只写第一行
+  expect(text).toContain('✗ false && npm test -- --grep "很长的名字"')
+  expect(text).not.toContain('echo 第二行')
+
+  await ui.press({ key: 'fail:0' })
+  expect(filled).toEqual([{ text: command, mode: 'replace' }])
+
+  draft = '帮我看看'
+  await ui.press({ key: 'fail:0' })
+  expect(filled[1]).toEqual({ text: `\n${command}`, mode: 'append' })
+
+  // 开着对话框时放不进去，说一声
+  isFilled = false
+  await ui.press({ key: 'fail:0' })
+  expect(toasts).toEqual(['输入框现在放不进去（可能开着别的对话框）'])
+})
+
+// ---------- 原地打转提醒 ----------
+
+test('主对话里同一条命令连着失败 3 次弹一次提示；子 agent 的不算，中间跑别的命令不打断', async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const fail = (agentId?: string) => $.tool.call({ tool: 'Bash', command: 'false && npm test', ...(agentId ? { agentId } : {}) })
+
+  await fail()
+  await fail()
+  // 子 agent 跑同一条命令失败不算进主对话
+  await fail('a1')
+  await $.tool.call({ tool: 'Edit', file_path: `${CWD}/src/a.ts`, old_string: 'b', new_string: 'c\nd' })
+  expect(toasts).toEqual([])
+  await fail()
+  expect(toasts).toEqual(['同一条命令连着失败 3 次了，可能在原地打转：false && npm test'])
+  // 再失败也不重复弹
+  await fail()
+  expect(toasts).toHaveLength(1)
+
+  // 别的命令成功了不影响它
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await fail()
+  expect(toasts).toHaveLength(1)
+  // 等工具跑完后台刷新的 git 状态
+  await settle()
+})
+
+test('同一条命令成功一次后重新数，下一轮也重新数', async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts })
+  // 第三次起这条命令成功了
+  let runs = 0
+  on('tool.call', { tool: 'Bash' }, ($, e, next) => {
+    if (e.command !== 'flaky') {
+      return next(e)
+    }
+    runs += 1
+
+    return runs === 3 ? { result: { stdout: 'ok', stderr: '', interrupted: false, isImage: false } } : { isError: true as const, result: 'Exit code 1' }
+  })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  for (let i = 0; i < 4; i += 1) {
+    await $.tool.call({ tool: 'Bash', command: 'flaky' })
+  }
+  // 失败、失败、成功、失败：没有连着三次
+  expect(toasts).toEqual([])
+
+  await complete($, 't1')
+  await $.turn.start({ text: 'hi', turnId: 't2' })
+  for (let i = 0; i < 2; i += 1) {
+    await $.tool.call({ tool: 'Bash', command: 'flaky' })
+  }
+  // 上一轮最后那次失败不带到这一轮
+  expect(toasts).toEqual([])
+  await settle()
+})
+
+test('一轮里同一个文件改到 10 次弹一次提示', async ($, on) => {
+  const toasts: string[] = []
+  world(on, {}, { toasts })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const edit = () => $.tool.call({ tool: 'Edit', file_path: `${CWD}/src/a.ts`, old_string: 'b', new_string: 'c\nd' })
+  for (let i = 0; i < 9; i += 1) {
+    await edit()
+  }
+  expect(toasts).toEqual([])
+  await edit()
+  expect(toasts).toEqual(['这一轮 src/a.ts 已经改了 10 次，可能在原地打转'])
+  await edit()
+  expect(toasts).toHaveLength(1)
+  await settle()
 })
 
 // ---------- 明细里点着看数据 ----------

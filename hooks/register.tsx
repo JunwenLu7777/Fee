@@ -1,34 +1,55 @@
 import { atom, memberOf, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionRateLimit, SessionUsage, ToolCallResult, UiPressArgument } from 'claude-code'
+import type {
+  EngineInterface,
+  PluginOptions,
+  Register,
+  SessionRateLimit,
+  SessionUsage,
+  ToolCallResult,
+  UiPressArgument,
+} from 'claude-code'
 
-import type { HudActivity, HudDiff, HudGit, HudLimit, HudStats, HudTodo, HudTokens } from '../types'
+import type { HudActivity, HudDaily, HudDiff, HudGit, HudLimit, HudStats, HudTodo, HudTokens } from '../types'
 
-import { cellWidth, clip, formatElapsed, formatSpan, formatTokens } from './format'
+import { cellWidth, clip, dayKey, formatClock, formatElapsed, formatSpan, formatTokens, formatWhen } from './format'
+import { MIN_ELAPSED_SHARE, alertText, limitWindows } from './forecast'
+import type { LimitWindow } from './forecast'
+import { SNAPSHOT_SCRIPT, parseNumstat, parseSnapshot } from './snapshot'
+import type { Snapshot } from './snapshot'
+import { parseDaily, parseStored } from './spend'
 import {
   EDIT_TOOLS,
+  LOOP_EDITS,
+  LOOP_FAILS,
   SHELL_TOOLS,
   addUsage,
+  bump,
   callLabel,
+  compactForecast,
   costSince,
   countPatch,
   defaultView,
+  drop,
   emptyReceipt,
   isFailed,
   matchTurn,
   pushCall,
   pushTurn,
   relativePath,
+  sumLines,
   toTurn,
   withAgentRun,
   withAgentTool,
   withCommand,
   withEdit,
+  withLastContext,
   withLastCost,
   withSpawn,
   withStatuses,
   withTokens,
   withToolTime,
 } from './ledger'
+import type { CompactForecast } from './ledger'
 import { drawDetails, receiptPieces } from './details'
 
 const stats = atom({ plugin: 'hud', key: 'stats' } as const, null)
@@ -56,17 +77,66 @@ const agentLog = atom({ plugin: 'hud', key: 'agentLog' } as const, [])
 const isExpanded = atom({ plugin: 'hud', key: 'isExpanded' } as const, false)
 const detailsView = atom({ plugin: 'hud', key: 'detailsView' } as const, defaultView())
 const toolCalls = atom({ plugin: 'hud', key: 'toolCalls' } as const, [])
+const warnedLimits = atom({ plugin: 'hud', key: 'warnedLimits' } as const, {})
+const baseTree = atom({ plugin: 'hud', key: 'baseTree' } as const, null)
+const daily = atom({ plugin: 'hud', key: 'daily' } as const, null)
+const compactAt = atom({ plugin: 'hud', key: 'compactAt' } as const, null)
 
 const HIDDEN_KEY = 'isHidden'
+// 上一次 ccusage 算出来的每天花费，下次启动先拿它画
+const DAILY_KEY = 'daily'
 // 引擎给插件的 rateLimits 只有 5h / 7d，Fable 的周额度得自己去 /usage 用的接口拿
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const FABLE_MIN_GAP_MS = 120_000
 const FABLE_EVERY_MS = 300_000
 const COPIED_MS = 1500
-// 这些工具跑完可能改了文件，跑完顺手刷新 git 状态
-const MUTATING_TOOLS = new Set(['Bash', 'Edit', 'Write', 'NotebookEdit'])
+// 额度、原地打转这些提醒停留的时间
+const ALERT_MS = 8000
+// 这些工具跑完可能改了文件，跑完顺手刷新 git 状态和改动行数
+const MUTATING_TOOLS = new Set([...EDIT_TOOLS, ...SHELL_TOOLS])
 const SPINNER = ['◐', '◓', '◑', '◒']
 const SEP = ' │ '
+
+// ---------- /config 里能改的几个门槛（plugin.json 的 userConfig），没设就用默认值 ----------
+
+type Config = {
+  // 同一条命令连着失败几次、同一个文件一轮里改几次提醒原地打转；0 不提醒
+  loopFails: number
+  loopEdits: number
+  // 额度照现在的速度会提前用完时弹不弹提示（HUD 上照样写）
+  limitAlert: boolean
+  // 额度窗口过了百分之几才开始预测
+  forecastAfter: number
+  // 还能撑几轮以内才在 HUD 上写「约 N 轮后压缩」；0 不写
+  compactTurns: number
+}
+
+const DEFAULT_CONFIG: Config = {
+  loopFails: LOOP_FAILS,
+  loopEdits: LOOP_EDITS,
+  limitAlert: true,
+  forecastAfter: MIN_ELAPSED_SHARE * 100,
+  compactTurns: 10,
+}
+
+let config = DEFAULT_CONFIG
+
+// 设置里存的可能是数字也可能是字符串；不是数就用默认值，超出范围的截到范围里
+const numberOption = (v: unknown, fallback: number, max: number) => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN
+
+  return Number.isFinite(n) ? Math.max(0, Math.min(max, Math.round(n))) : fallback
+}
+
+const readConfig = (o: PluginOptions): Config => ({
+  loopFails: numberOption(o.loopFails, DEFAULT_CONFIG.loopFails, 100),
+  loopEdits: numberOption(o.loopEdits, DEFAULT_CONFIG.loopEdits, 1000),
+  limitAlert: typeof o.limitAlert === 'boolean' ? o.limitAlert : DEFAULT_CONFIG.limitAlert,
+  forecastAfter: numberOption(o.forecastAfter, DEFAULT_CONFIG.forecastAfter, 90),
+  compactTurns: numberOption(o.compactTurns, DEFAULT_CONFIG.compactTurns, 100),
+})
+
+const forecastShare = () => config.forecastAfter / 100
 
 // ---------- 数据整理 ----------
 
@@ -227,15 +297,13 @@ const prettyModel = (id: string, window: number | null) => {
 
 // ---------- 格式化 ----------
 
-const formatClock = (at: number, offsetMinutes: number) => {
-  const d = new Date(at + offsetMinutes * 60_000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-
-  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`
-}
-
 const levelColor = (percent: number, warn: number, danger: number) =>
   percent >= danger ? 'red' : percent >= warn ? 'yellow' : 'green'
+
+const SEVERITY = ['green', 'yellow', 'red']
+
+// 两个颜色里更严重的那个
+const worse = (a: string, b: string) => (SEVERITY.indexOf(a) >= SEVERITY.indexOf(b) ? a : b)
 
 // 一格都填不满的条只占地方，不画
 const meter = (percent: number, cells: number) => {
@@ -292,9 +360,21 @@ type View = {
   turns: number | null
   version: string | null
   tzOffset: number | null
+  // 照最近几轮的涨法，还能撑几轮到自动压缩
+  compact: CompactForecast | null
 }
 
 const DOT: Piece = { text: ' · ', dim: true }
+
+// 约 4 轮后压缩：一轮以内标红，三轮以内标黄；还能撑很多轮的不占地方（几轮以内才写，/config 里能改）
+const compactPieces = (c: CompactForecast | null): Piece[] => {
+  if (!c || config.compactTurns === 0 || c.turnsLeft > config.compactTurns) {
+    return []
+  }
+  const tone = c.turnsLeft <= 1 ? { color: 'red' } : c.turnsLeft <= 3 ? { color: 'yellow' } : { dim: true }
+
+  return [{ text: c.turnsLeft === 0 ? ' 快压缩了' : ` 约${c.turnsLeft}轮后压缩`, ...tone }]
+}
 
 const modelSegment = ({ modelId: id, effort: level, stats: s }: View): Variant[] => {
   if (!id) {
@@ -311,11 +391,12 @@ const modelSegment = ({ modelId: id, effort: level, stats: s }: View): Variant[]
   ]
 }
 
-const contextSegment = ({ stats: s }: View): Variant[] => {
+const contextSegment = ({ stats: s, compact: c }: View): Variant[] => {
   const percent = s?.contextPercent
   if (percent == null) {
     return [[]]
   }
+  const soon = compactPieces(c)
   const color = levelColor(percent, 70, 85)
   const label: Piece = { text: 'ctx ', dim: true }
   const shape = meter(percent, 10)
@@ -326,60 +407,63 @@ const contextSegment = ({ stats: s }: View): Variant[] => {
       ? [{ text: ` ${formatTokens(s.contextTokens)}/${formatTokens(s.contextWindow)}`, dim: true }]
       : []
 
-  return [[label, ...bar, value, ...used], [label, ...bar, value], [label, value]]
+  return [
+    [label, ...bar, value, ...used, ...soon],
+    [label, ...bar, value, ...soon],
+    [label, value, ...soon],
+  ]
 }
 
+// 照现在的速度重置前就会用完的，百分比至少变黄，后面跟上约几点用完；快到了标红
 const limitPieces = (
-  label: string,
-  limit: HudLimit,
+  w: LimitWindow,
   at: number,
+  offset: number,
   { bar, reset }: { bar: boolean; reset: boolean },
 ): Piece[] => {
-  const color = levelColor(limit.percent, 50, 80)
+  const { limit, forecast } = w
+  const warn = forecast ? (forecast.isUrgent ? 'red' : 'yellow') : 'green'
+  const color = worse(levelColor(limit.percent, 50, 80), warn)
   const shape = bar ? meter(limit.percent, 5) : null
 
   return [
-    { text: `${label} `, dim: true },
+    { text: `${w.label} `, dim: true },
     ...(shape ? [{ text: `${shape} `, color }] : []),
     { text: `${limit.percent}%`, color },
     ...(reset && limit.resetsAt != null && limit.resetsAt > at
       ? [{ text: ` ↻${formatSpan(limit.resetsAt - at)}`, dim: true }]
       : []),
+    ...(forecast ? [{ text: ` 约${formatWhen(forecast.runOutAt, at, offset)}用完`, color: warn }] : []),
   ]
 }
 
-// 过了重置时间还没有新读数时，旧的百分比已经不作数了（比如歇了一阵回来），按 0% 画
-const live = (limit: HudLimit | null | undefined, at: number): HudLimit | null => {
-  if (!limit) {
-    return null
-  }
+// 插件环境里的 Date 不一定是本机时区，优先用启动时问到的偏移
+const offsetOf = (tz: number | null, at: number) => tz ?? -new Date(at).getTimezoneOffset()
 
-  return limit.resetsAt != null && at > 0 && limit.resetsAt <= at ? { percent: 0, resetsAt: null } : limit
-}
-
-const limitsSegment = ({ stats: s, now: at, fable: f }: View): Variant[] => {
-  const fiveHour = live(s?.fiveHour, at)
-  const sevenDay = live(s?.sevenDay, at)
-  const fableWeek = live(f, at)
-  const windows = [
-    fiveHour ? { label: '5h', limit: fiveHour, showReset: true } : null,
-    // 周限额只在快用完时才值得看倒计时
-    sevenDay ? { label: '7d', limit: sevenDay, showReset: sevenDay.percent >= 70 } : null,
-    fableWeek ? { label: 'fable', limit: fableWeek, showReset: fableWeek.percent >= 70 } : null,
-  ].filter(w => w !== null)
+const limitsSegment = ({ stats: s, now: at, fable: f, tzOffset: tz }: View): Variant[] => {
+  const windows = limitWindows(s, f, at, forecastShare()).map(w => ({
+    ...w,
+    // 周限额只在快用完、或者照现在的速度会提前用完时才值得看倒计时
+    showReset: w.label === '5h' || w.limit.percent >= 70 || w.forecast != null,
+  }))
   if (windows.length === 0) {
     return [[]]
   }
+  const offset = offsetOf(tz, at)
   const join = (parts: Piece[][]) => parts.flatMap((p, i) => (i ? [DOT, ...p] : p))
   const all = (bar: boolean, withReset: boolean) =>
-    join(windows.map(w => limitPieces(w.label, w.limit, at, { bar, reset: withReset && w.showReset })))
-  const highest = windows.reduce((a, b) => (b.limit.percent > a.limit.percent ? b : a))
+    join(windows.map(w => limitPieces(w, at, offset, { bar, reset: withReset && w.showReset })))
+  // 只放得下一个时：有会提前用完的，留最先用完的那个；没有就留占用最高的
+  const soonest = windows
+    .flatMap(w => (w.forecast ? [{ w, runOutAt: w.forecast.runOutAt }] : []))
+    .sort((a, b) => a.runOutAt - b.runOutAt)[0]?.w
+  const highest = soonest ?? windows.reduce((a, b) => (b.limit.percent > a.limit.percent ? b : a))
 
   return [
     all(true, true),
     all(false, true),
     all(false, false),
-    limitPieces(highest.label, highest.limit, at, { bar: false, reset: false }),
+    limitPieces(highest, at, offset, { bar: false, reset: false }),
     [],
   ]
 }
@@ -513,9 +597,7 @@ const clockSegment = ({ now: at, tzOffset: tz }: View): Variant[] => {
   if (!at) {
     return [[]]
   }
-  const offset = tz ?? -new Date(at).getTimezoneOffset()
-
-  return [[{ text: formatClock(at, offset) }], []]
+  return [[{ text: formatClock(at, offsetOf(tz, at)) }], []]
 }
 
 const versionSegment = ({ version: v }: View): Variant[] => (v ? [[{ text: `v${v}`, dim: true }], []] : [[]])
@@ -634,9 +716,125 @@ const refreshGit = async ($: EngineInterface) => {
   }
 }
 
+// ---------- 改动行数：git 快照对比 ----------
+
+// 拍快照、比两棵树一个接一个来，免得同时跑一堆 git
+let gitQueue: Promise<unknown> = Promise.resolve()
+
+const serially = <T,>(work: () => Promise<T>): Promise<T> => {
+  const run = gitQueue.then(work, work)
+  gitQueue = run.catch(() => undefined)
+
+  return run
+}
+
+// 大仓库拍一次快照超时（或者没有 sh）就不再拍，小票退回按 Edit / Write 算；重新加载后再试
+let isSnapshotOff = false
+const SNAPSHOT_TIMEOUT_MS = 5000
+
+const takeSnapshot = ($: EngineInterface): Promise<Snapshot | null> =>
+  isSnapshotOff
+    ? Promise.resolve(null)
+    : serially(async () => {
+        const ran = await $.process
+          .run(['sh', '-c', SNAPSHOT_SCRIPT], { timeoutMs: SNAPSHOT_TIMEOUT_MS })
+          .catch(() => {
+            isSnapshotOff = true
+
+            return null
+          })
+
+        return ran?.exitCode === 0 ? parseSnapshot(ran.stdout) : null
+      })
+
+// 从 from 这棵树到快照 to，改了哪些文件；比不了时为 null
+const diffTrees = ($: EngineInterface, from: string, to: Snapshot) =>
+  from === to.tree
+    ? Promise.resolve([])
+    : serially(async () => {
+        const ran = await $.process
+          .run(['git', 'diff', '--numstat', '-z', '-M', from, to.tree], {
+            cwd: to.root,
+            timeoutMs: SNAPSHOT_TIMEOUT_MS,
+          })
+          .catch(() => null)
+
+        return ran?.exitCode === 0 ? parseNumstat(ran.stdout, to.prefix) : null
+      })
+
+// 会话开始时拍一张，HUD 上的 +N -M 是从这时起净改的；热重载时已经有了就不再拍
+const initBaseline = async ($: EngineInterface) => {
+  if (await read($, baseTree)) {
+    return
+  }
+  const snap = await takeSnapshot($)
+  if (snap) {
+    await update($, baseTree, current => current ?? snap.tree)
+  }
+}
+
+// 现在的工作区和会话开始时、这一轮开始时各比一下：HUD 上的 +N -M、这一轮小票里改的文件都换成准的
+const measureChanges = async ($: EngineInterface) => {
+  const [base, a] = await Promise.all([read($, baseTree), read($, activity)])
+  const turnBase = a?.isRunning ? (a.treeAtStart ?? null) : null
+  if (!base && !turnBase) {
+    return
+  }
+  const snap = await takeSnapshot($)
+  if (!snap) {
+    return
+  }
+  if (base) {
+    const files = await diffTrees($, base, snap)
+    if (files) {
+      await update($, diff, () => sumLines(files))
+    }
+  }
+  if (a && turnBase) {
+    const files = await diffTrees($, turnBase, snap)
+    if (files) {
+      await update($, activity, x =>
+        x?.isRunning && x.turnId === a.turnId ? { ...x, receipt: { ...x.receipt, files } } : x,
+      )
+    }
+  }
+}
+
+// 工具跑完一个比一次；正在比时又来了就排一次，排着的那次会看到最新的样子
+let changesRun: Promise<void> = Promise.resolve()
+let isChangesQueued = false
+
+const refreshChanges = ($: EngineInterface) => {
+  if (!isChangesQueued) {
+    isChangesQueued = true
+    changesRun = changesRun
+      .then(() => {
+        isChangesQueued = false
+
+        return measureChanges($)
+      })
+      .catch(() => undefined)
+  }
+
+  return changesRun
+}
+
+// 自动压缩在上下文到多少 token 时触发：按 /context 的算法在本地估，不发请求
+const refreshCompactAt = async ($: EngineInterface) => {
+  const usage = await $.session.usage({ breakdown: 'summary' }).catch(() => null)
+  const b = usage?.context.breakdown
+  const threshold = b?.isAutoCompactEnabled && b.autoCompactThreshold ? b.autoCompactThreshold : null
+  await update($, compactAt, () => threshold)
+}
+
+// 换了模型，上下文窗口可能跟着变，自动压缩的点重新问一次
 const refreshModel = async ($: EngineInterface) => {
   const id = await $.session.model()
+  const previous = await read($, modelId)
   await update($, modelId, () => id)
+  if (id !== previous) {
+    await refreshCompactAt($)
+  }
 }
 
 // 时间、会话时长和倒计时都按分钟显示，分钟变了才写，免得每次都重画
@@ -702,10 +900,116 @@ const refreshFable = async ($: EngineInterface) => {
     if (res?.ok) {
       const found = parseFable(res.text)
       await update($, fable, () => found)
+      await checkLimits($)
     }
   } finally {
     isFableRefreshing = false
   }
+}
+
+// 同一个额度窗口只提醒一次；重置时间差一小时以内都算同一个窗口
+const isSameWindow = (warned: number | undefined, resetsAt: number) =>
+  warned != null && Math.abs(warned - resetsAt) < 3_600_000
+
+// 照现在的速度重置前就会用完时弹一次提示
+const checkLimits = async ($: EngineInterface) => {
+  const [s, f, tz, warned, at] = await Promise.all([
+    read($, stats),
+    read($, fable),
+    read($, tzOffset),
+    read($, warnedLimits),
+    $.clock.now(),
+  ])
+  if (!config.limitAlert) {
+    return
+  }
+  for (const w of limitWindows(s, f, at, forecastShare())) {
+    const resetsAt = w.limit.resetsAt
+    if (!w.forecast || resetsAt == null || isSameWindow(warned[w.label], resetsAt)) {
+      continue
+    }
+    $.ui.toast(alertText(w, at, offsetOf(tz, at)), { timeoutMs: ALERT_MS })
+    await update($, warnedLimits, list => ({ ...list, [w.label]: resetsAt }))
+  }
+}
+
+// ---------- 每天花费：ccusage ----------
+
+// ccusage 要读完本机所有会话的记录，几秒到十几秒；隔这么久才再算一次，点「刷新」不受限
+const DAILY_EVERY_MS = 15 * 60_000
+const DAILY_DAYS = 30
+const DAILY_TIMEOUT_MS = 120_000
+const DAY_MS = 86_400_000
+let isDailyRunning = false
+let dailyTriedAt = 0
+
+const emptyDaily = (): HudDaily => ({ days: [], fetchedAt: null, error: null, isRunning: false })
+
+// 没装 ccusage 时 nice 报「No such file or directory」、退出码 127
+const dailyError = (ran: { exitCode: number; stderr: string } | null) => {
+  if (!ran) {
+    return 'ccusage 跑太久没算完'
+  }
+  if (ran.exitCode === 127 || /No such file|not found/i.test(ran.stderr)) {
+    return 'missing'
+  }
+  const first = ran.stderr.trim().split('\n')[0] ?? ''
+
+  return first ? clip(first, 80) : `ccusage 出错，退出码 ${ran.exitCode}`
+}
+
+// 用 ccusage 算最近 30 天每天花了多少（本机所有会话）；没装、出错都留着上一次的数
+const refreshDaily = async ($: EngineInterface, force = false) => {
+  const [at, current, tz] = await Promise.all([$.clock.now(), read($, daily), read($, tzOffset)])
+  if (isDailyRunning) {
+    return
+  }
+  if (!force) {
+    const last = Math.max(dailyTriedAt, current?.fetchedAt ?? 0)
+    if (last && at - last < DAILY_EVERY_MS) {
+      return
+    }
+    // 同时开着几个会话时，别的会话刚算过就直接拿它存下的
+    const stored = parseStored(await $.store.get(DAILY_KEY).catch(() => null))
+    if (stored && at - stored.fetchedAt < DAILY_EVERY_MS && stored.fetchedAt > (current?.fetchedAt ?? 0)) {
+      await update($, daily, d => ({ ...(d ?? emptyDaily()), days: stored.days, fetchedAt: stored.fetchedAt, error: null }))
+
+      return
+    }
+  }
+  isDailyRunning = true
+  dailyTriedAt = at
+  try {
+    await update($, daily, d => ({ ...(d ?? emptyDaily()), isRunning: true }))
+    const since = dayKey(at - (DAILY_DAYS - 1) * DAY_MS, offsetOf(tz, at)).replace(/-/g, '')
+    // ccusage 很吃 CPU，降低优先级跑，别和手头的活抢
+    const ran = await $.process
+      .run(['nice', '-n', '10', 'ccusage', 'daily', '--json', '--since', since], { timeoutMs: DAILY_TIMEOUT_MS })
+      .catch(() => null)
+    const days = ran?.exitCode === 0 ? parseDaily(ran.stdout) : null
+    if (days) {
+      await update($, daily, () => ({ days, fetchedAt: at, error: null, isRunning: false }))
+      await $.store.set(DAILY_KEY, { days, fetchedAt: at })
+    } else {
+      const error = ran?.exitCode === 0 ? 'ccusage 的输出看不懂' : dailyError(ran)
+      await update($, daily, d => ({ ...(d ?? emptyDaily()), error, isRunning: false }))
+    }
+  } finally {
+    isDailyRunning = false
+  }
+}
+
+// 启动时先拿上一次存下的画上，再看要不要重新算。热重载时上一个环境里没跑完的 ccusage 已经没人等了，
+// 「正在刷新」要清掉，不然一直挂着
+const loadDaily = async ($: EngineInterface) => {
+  await update($, daily, d => (d?.isRunning ? { ...d, isRunning: false } : d))
+  if (!(await read($, daily))) {
+    const stored = parseStored(await $.store.get(DAILY_KEY))
+    if (stored) {
+      await update($, daily, d => d ?? { ...stored, error: null, isRunning: false })
+    }
+  }
+  await refreshDaily($)
 }
 
 const settingsEffort = async ($: EngineInterface) => {
@@ -725,7 +1029,8 @@ const track = async (
   args: Record<string, unknown>,
   result: Record<string, unknown>,
 ) => {
-  if (tool === 'Edit' || tool === 'Write') {
+  // 在 git 仓库里 HUD 上的 +N -M 由快照对比算（工具跑完马上比一次），这里不再加，免得数字先跳一下再落回去
+  if ((tool === 'Edit' || tool === 'Write') && (isSnapshotOff || !(await read($, baseTree)))) {
     const counted = countPatch(result)
     if (counted) {
       await update($, diff, d => ({
@@ -764,9 +1069,12 @@ const track = async (
 
 // 会话目录，小票里的文件路径写成相对它的；session.start 时记下
 let cwdPath = ''
+// 记命令连着失败几次时，命令只取这么长做名字
+const COMMAND_KEY_MAX = 500
 
 // 每次工具调用：耗时记进统计；子 agent 的调用记到它名下；这一轮还在跑时，命令和改的文件记进小票。
-// 主对话这一轮跑完后子 agent 还在后台跑的，不再算进任何一轮的小票
+// 主对话这一轮跑完后子 agent 还在后台跑的，不再算进任何一轮的小票。
+// 主对话里同一条命令连着失败、同一个文件改了太多次，弹个提示：可能在原地打转（子 agent 的不算，免得刷屏）
 const record = async (
   $: EngineInterface,
   e: Record<string, unknown>,
@@ -785,21 +1093,50 @@ const record = async (
   if (agentId) {
     await update($, agentLog, log => withAgentTool(log, agentId))
   }
+  const isMain = agentId == null
   const result = failed ? null : okResult(done)
   const path = text(e.file_path) ?? text(e.notebook_path)
-  await update($, activity, a => {
+  const file = path ? relativePath(path, cwdPath) : null
+  const command = (text(e.command) ?? '').trim().slice(0, COMMAND_KEY_MAX)
+  const isShell = SHELL_TOOLS.has(tool)
+  const isEdit = EDIT_TOOLS.has(tool) && result != null && file != null
+  // 热重载前记下的这一轮没有 fails / edits
+  const after = await update($, activity, a => {
     if (!a?.isRunning) {
       return a
     }
-    if (SHELL_TOOLS.has(tool)) {
-      return { ...a, receipt: withCommand(a.receipt, text(e.command) ?? '', failed) }
+    if (isShell) {
+      const fails = a.fails ?? {}
+
+      return {
+        ...a,
+        receipt: withCommand(a.receipt, command, failed),
+        fails: !isMain ? fails : failed ? bump(fails, command) : drop(fails, command),
+      }
     }
-    if (EDIT_TOOLS.has(tool) && result && path) {
-      return { ...a, receipt: withEdit(a.receipt, relativePath(path, cwdPath), countPatch(result)) }
+    if (isEdit && result && file) {
+      const edits = a.edits ?? {}
+
+      return {
+        ...a,
+        receipt: withEdit(a.receipt, file, countPatch(result)),
+        edits: isMain ? bump(edits, file) : edits,
+      }
     }
 
     return a
   })
+  if (!isMain || !after?.isRunning) {
+    return
+  }
+  const { loopFails, loopEdits } = config
+  if (isShell && failed && loopFails > 0 && after.fails[command] === loopFails) {
+    const label = clip(command.split('\n')[0] ?? '', 60)
+    $.ui.toast(`同一条命令连着失败 ${loopFails} 次了，可能在原地打转：${label}`, { timeoutMs: ALERT_MS })
+  }
+  if (isEdit && file && loopEdits > 0 && after.edits[file] === loopEdits) {
+    $.ui.toast(`这一轮 ${clip(file, 60)} 已经改了 ${loopEdits} 次，可能在原地打转`, { timeoutMs: ALERT_MS })
+  }
 }
 
 // HUD 第一行前面 ▸ 加一个空格的宽度
@@ -807,7 +1144,7 @@ const TOGGLE_WIDTH = 2
 
 // 展开时 HUD 下方的明细；最多占终端一半高、20 行
 const detailsOf = async ($: EngineInterface, columns: number, viewportRows: number) => {
-  const [view, log, live, tools, calls, agentsSeen, s, t, at] = await Promise.all([
+  const [view, log, live, tools, calls, agentsSeen, s, t, at, spend, fb, tz, threshold] = await Promise.all([
     read($, detailsView),
     read($, turnLog),
     read($, activity),
@@ -817,8 +1154,14 @@ const detailsOf = async ($: EngineInterface, columns: number, viewportRows: numb
     read($, stats),
     read($, tokens),
     read($, now),
+    read($, daily),
+    read($, fable),
+    read($, tzOffset),
+    read($, compactAt),
   ])
   const isRunning = live?.isRunning === true
+  const offset = offsetOf(tz, at ?? 0)
+  const context = s?.contextTokens ?? null
   const data = {
     view,
     turns: log,
@@ -830,9 +1173,37 @@ const detailsOf = async ($: EngineInterface, columns: number, viewportRows: numb
     tokens: t,
     // 这一轮在跑时每秒都有新的耗时，比按分钟走的 now 新
     now: isRunning ? live.startedAt + live.elapsedMs : (at ?? 0),
+    daily: spend,
+    alerts: limitWindows(s, fb, at ?? 0, forecastShare()).flatMap(w =>
+      w.forecast ? [{ text: alertText(w, at ?? 0, offset), isUrgent: w.forecast.isUrgent }] : [],
+    ),
+    offset,
+    context,
+    compactAt: threshold,
+    compact: compactForecast(log, context, threshold),
   }
 
   return { data, size: { columns, rows: Math.max(10, Math.min(20, Math.floor(viewportRows / 2))) } }
+}
+
+// 失败的命令放进输入框：输入框是空的就直接放，已经打了字就另起一行接在后面，不动你打的字
+const fillPrompt = async ($: EngineInterface, command: string) => {
+  const box = await $.prompt.read().catch(() => null)
+  const hasDraft = (box?.text.trim() ?? '') !== ''
+  const done = await $.prompt
+    .fill(hasDraft ? { text: `\n${command}`, mode: 'append' } : { text: command, mode: 'replace' })
+    .catch(() => null)
+  if (!done?.isFilled) {
+    $.ui.toast('输入框现在放不进去（可能开着别的对话框）', { timeoutMs: 3000 })
+  }
+}
+
+// 展开明细时顺便看看每天花费要不要重新算
+const toggleDetails = async ($: EngineInterface) => {
+  const open = await update($, isExpanded, v => !v)
+  if (open) {
+    void refreshDaily($).catch(() => undefined)
+  }
 }
 
 const tick = async ($: EngineInterface) => {
@@ -844,7 +1215,9 @@ const tick = async ($: EngineInterface) => {
   await update($, activity, a => (a?.isRunning ? { ...a, elapsedMs: at - a.startedAt } : a))
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  config = readConfig(options)
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({
@@ -877,7 +1250,12 @@ export const register: Register = on => {
     await refreshTurns($)
     await refreshVersion($)
     await refreshOffset($)
+    await checkLimits($)
     void refreshFable($)
+    void initBaseline($).catch(() => undefined)
+    void loadDaily($).catch(() => undefined)
+    // 热重载时模型没变也问一次，旧版本没记过自动压缩的点
+    void refreshCompactAt($).catch(() => undefined)
 
     return started
   })
@@ -889,6 +1267,8 @@ export const register: Register = on => {
     await update($, turnLog, log => withLastCost(log, cost))
     await refreshTurns($)
     const index = await read($, turns)
+    // 先给工作区拍一张，这一轮跑完再拍一张，两张一比就是这一轮改的
+    const snap = await takeSnapshot($)
     await update($, activity, () => ({
       turnId: e.turnId,
       index,
@@ -899,6 +1279,11 @@ export const register: Register = on => {
       isRunning: true,
       costAtStart: cost,
       receipt: emptyReceipt(),
+      fails: {},
+      edits: {},
+      treeAtStart: snap?.tree ?? null,
+      contextAtStart: s?.contextTokens ?? null,
+      isCompacted: false,
     }))
     await refreshModel($)
 
@@ -936,6 +1321,7 @@ export const register: Register = on => {
       await update($, activity, a => (a?.activeTool === name ? { ...a, activeTool: null } : a))
       if (MUTATING_TOOLS.has(e.tool)) {
         void refreshGit($)
+        void refreshChanges($)
       }
     }
   })
@@ -961,23 +1347,35 @@ export const register: Register = on => {
     if (answer) {
       await update($, { ...answered, id: hashText(answer) }, () => true)
     }
+    // 小票里改的文件以 git 前后对比的为准
+    await refreshChanges($)
     const [at, s] = await Promise.all([$.clock.now(), read($, stats)])
     const finished = await update($, activity, a =>
       a ? { ...a, isRunning: false, activeTool: null, elapsedMs: at - a.startedAt } : a,
     )
     if (finished) {
-      await update($, turnLog, log => pushTurn(log, toTurn(finished, e.durationMs, e.reason, s?.costUsd ?? null)))
+      await update($, turnLog, log =>
+        pushTurn(log, toTurn(finished, e.durationMs, e.reason, s?.costUsd ?? null, s?.contextTokens ?? null)),
+      )
     }
     await refreshNow($)
     await refreshGit($)
     await refreshAgents($)
     void refreshFable($)
+    void refreshDaily($).catch(() => undefined)
 
     return done
   })
 
   on('session.measure', async ($, e, next) => {
     await update($, stats, s => toStats(e, s?.startedAt ?? null))
+    if (e.changed.includes('rateLimits')) {
+      await checkLimits($)
+    }
+    // 两轮之间才到的上下文读数算到上一轮（只往大了改）
+    if (!(await read($, activity))?.isRunning) {
+      await update($, turnLog, log => withLastContext(log, e.context.tokens ?? null))
+    }
     // 正在跑的这一轮实时算花费；两轮之间才到的花费算到上一轮
     const cost = e.cost?.usd ?? null
     if (cost != null) {
@@ -991,6 +1389,16 @@ export const register: Register = on => {
     }
 
     return next(e)
+  })
+
+  // 主对话这一轮里压缩过，这一轮上下文的涨跌就不算数了（precompute 只是先备好摘要，不算）
+  on('session.compact', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId == null && e.trigger !== 'precompute' && !('skip' in done && done.skip)) {
+      await update($, activity, a => (a?.isRunning ? { ...a, isCompacted: true } : a))
+    }
+
+    return done
   })
 
   // 起子 agent 时记下它是什么、在第几轮起的
@@ -1020,8 +1428,8 @@ export const register: Register = on => {
   })
 
   // /clear 和 /resume 换到了另一个会话：引擎的花费、上下文、开始时间都换成新会话的
-  // （measure 不带开始时间，得重新问），自己累计的 token、改动行数、待办和上一轮也清掉，
-  // 不然两边对不上。不放在 session.start 里清：热重载也会触发 session.start，会把正用着的数清掉
+  // （measure 不带开始时间，得重新问），自己累计的 token、改动行数、待办和上一轮也清掉，不然两边对不上；
+  // 改动行数从这时重新拍快照来比。不放在 session.start 里清：热重载也会触发 session.start，会把正用着的数清掉
   on('command.run', { command: ['clear', 'resume'] }, async ($, e, next) => {
     const done = await next(e)
     const usage = await $.session.usage()
@@ -1035,7 +1443,9 @@ export const register: Register = on => {
     await update($, agentLog, () => [])
     await update($, toolCalls, () => [])
     await update($, detailsView, () => defaultView())
+    await update($, baseTree, () => null)
     await refreshTurns($)
+    void initBaseline($).catch(() => undefined)
 
     return done
   })
@@ -1152,7 +1562,7 @@ export const register: Register = on => {
     }
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded] = await Promise.all([
+    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded, log, threshold] = await Promise.all([
       read($, stats),
       read($, modelId),
       read($, effort),
@@ -1169,6 +1579,8 @@ export const register: Register = on => {
       read($, version),
       read($, tzOffset),
       read($, isExpanded),
+      read($, turnLog),
+      read($, compactAt),
     ])
     const view: View = {
       stats: s,
@@ -1186,6 +1598,7 @@ export const register: Register = on => {
       turns: tn,
       version: v,
       tzOffset: tz,
+      compact: compactForecast(log, s?.contextTokens ?? null, threshold),
     }
     const viewportColumns = e.viewport?.columns ?? 120
     // 每行前面留两格给 ▸
@@ -1210,14 +1623,18 @@ export const register: Register = on => {
 
     const toggle = (
       <Box flexShrink={0} marginRight={1}>
-        <Button key="hud:details" plain dimColor onPress={() => void update($, isExpanded, open => !open)}>
+        <Button key="hud:details" plain dimColor onPress={() => void toggleDetails($)}>
           {expanded ? '▾' : '▸'}
         </Button>
       </Box>
     )
     const shown = expanded ? await detailsOf($, columns, e.viewport?.rows ?? 40) : null
     const details = shown
-      ? drawDetails({ Box, Text, Button }, shown.data, shown.size, change => void update($, detailsView, change))
+      ? drawDetails({ Box, Text, Button }, shown.data, shown.size, {
+          setView: change => void update($, detailsView, change),
+          refreshDaily: () => void refreshDaily($, true).catch(() => undefined),
+          fillPrompt: command => void fillPrompt($, command),
+        })
       : null
 
     // 引擎自己的那行不能放在带 width 的 Box 里，否则整棵树会被拒绝，外层只靠 column 拉伸。

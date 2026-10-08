@@ -1,6 +1,46 @@
 {
   "name": "hud",
   "version": "0.1.0",
-  "description": "输入框下方的自定义 HUD：模型、上下文、花费、限额、分支、本轮计时；回复下方的复制按钮；每轮小票，点 HUD 展开的明细",
-  "types": "./types/index.d.ts"
+  "description": "输入框下方的自定义 HUD：模型、上下文和还能撑几轮、花费、限额和用完预测、分支、本轮计时；回复下方的复制按钮；原地打转提醒；每轮小票（git 对比改动），点 HUD 展开的明细和每天花费",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "loopFails": {
+      "type": "number",
+      "title": "原地打转提醒：同一条命令连着失败几次",
+      "description": "主对话一轮里同一条命令连着失败到这么多次时弹一次提示；0 不提醒",
+      "default": 3,
+      "min": 0,
+      "max": 100
+    },
+    "loopEdits": {
+      "type": "number",
+      "title": "原地打转提醒：同一个文件一轮里改几次",
+      "description": "主对话一轮里同一个文件改到这么多次时弹一次提示；0 不提醒",
+      "default": 10,
+      "min": 0,
+      "max": 1000
+    },
+    "limitAlert": {
+      "type": "boolean",
+      "title": "额度会提前用完时弹提示",
+      "description": "照现在的速度额度会在重置前用完时，每个窗口弹一次提示；关掉后 HUD 上照样写「约几点用完」",
+      "default": true
+    },
+    "forecastAfter": {
+      "type": "number",
+      "title": "额度窗口过了百分之几才预测",
+      "description": "窗口刚开始时数据少、预测不准；默认 10，5 小时额度就是开始半小时后",
+      "default": 10,
+      "min": 0,
+      "max": 90
+    },
+    "compactTurns": {
+      "type": "number",
+      "title": "还能撑几轮以内才提示自动压缩",
+      "description": "照最近几轮上下文的涨法，离自动压缩不到这么多轮时，HUD 上写「约 N 轮后压缩」；0 不写",
+      "default": 10,
+      "min": 0,
+      "max": 100
+    }
+  }
 }
