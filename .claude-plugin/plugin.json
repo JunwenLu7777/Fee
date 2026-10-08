@@ -1,11 +1,6 @@
 {
-  "name": "fee-hud",
+  "name": "hud",
   "version": "0.1.0",
-  "description": "Adds a [Fee💰] line to the Claude Code statusLine showing token I/O, cache hit %, session cost, today cost, and weekly run-out estimate.",
-  "author": {
-    "name": "junwen_lu",
-    "email": "junwen_lu@foxitsoftware.com"
-  },
-  "homepage": "https://github.com/JunwenLu7777/Fee",
-  "license": "MIT"
+  "description": "输入框下方的自定义 HUD：模型、上下文、花费、限额、分支、本轮计时",
+  "types": "./types/index.d.ts"
 }

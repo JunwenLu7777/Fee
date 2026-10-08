@@ -1,8 +1,4 @@
 .DS_Store
 node_modules/
-*.log
-
-# Stray runtime cache directories that some tools (omc HUD, claude-flow) create
-# in CWD when Claude Code is launched here. Not part of the plugin payload.
-.omc/
-.claude-flow/
+# 引擎加载 mod 时自动生成
+.claude-plugin/types/
