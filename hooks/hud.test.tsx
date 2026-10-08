@@ -152,7 +152,7 @@ const textOf = (node: RenderElement | string): string =>
       ? node.children.map(c => textOf(c as RenderElement | string)).join('')
       : ''
 
-// 每一行的文字：[原来的提示, 模型和限额, token 和花费, 工作区]
+// 每一行的文字：宽窗口 [原来的提示, 模型、限额和花费, 工作区]，窄窗口 [原来的提示, 模型和限额, token 和花费, 工作区]
 const rowsOf = async ($: Engine, columns = 200, surface: 'terminal' | 'desktop' = 'terminal') => {
   const ui = await mount($, columns, surface)
   const root = await ui.drawn()
@@ -174,30 +174,66 @@ const complete = ($: Engine, turnId: string, agentId?: string) =>
     ...(agentId ? { agentId } : {}),
   })
 
-test('原来的提示在最上面，HUD 分三行：模型和限额、token 和花费、工作区', async ($, on) => {
+const RESOURCES = '◆ Opus 5.5 · xhigh │ ctx ▰▰▰▱▱▱▱▱▱▱ 34% 68k/200k │ 5h ▰▱▱▱▱ 23% ↻1h30m · 7d ▰▰▱▱▱ 41% · fable ▰▱▱▱▱ 12%'
+// 第几轮、时间、版本紧跟在分支后面，不被推到屏幕最右边；NOW 是 UTC 12:00，date +%z 答 +0800
+const WORKSPACE = 'engineering-kit ⎇ main ±1 ?1 ↑1 │ #12 │ 20:00 │ v2.1.287'
+
+test('原来的提示在最上面，宽窗口 HUD 两行：模型、限额和花费一行，工作区一行', async ($, on) => {
   world(on)
   await start($)
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    const rows = await rowsOf($, 200, surface)
-    expect(rows.length).toBe(4)
-    expect(rows[0]).toBe(BYPASS)
-    for (const text of [
-      '◆ Opus 5.5 · xhigh',
-      'ctx ▰▰▰▱▱▱▱▱▱▱ 34% 68k/200k',
-      '5h ▰▱▱▱▱ 23% ↻1h30m',
-      '7d ▰▰▱▱▱ 41%',
-      'fable ▰▱▱▱▱ 12%',
-    ]) {
-      expect(rows[1]).toContain(text)
-    }
     // 周限额没到 70% 不显示倒计时
-    expect(rows[1]).not.toContain('↻3d')
-    expect(rows[2]).toBe('cost $1.23 · session 42m')
-    expect(rows[3]).toContain('engineering-kit ⎇ main ±1 ?1 ↑1')
-    // NOW 是 UTC 12:00，date +%z 答 +0800
-    expect(rows[3]).toContain('#12 │ 20:00 │ v2.1.287')
+    expect(await rowsOf($, 200, surface)).toEqual([BYPASS, `${RESOURCES} │ cost $1.23 · session 42m`, WORKSPACE])
   }
+})
+
+test('窗口窄于 150 列时拆成三行：token 和花费单独一行', async ($, on) => {
+  world(on)
+  await start($)
+
+  expect((await rowsOf($, 150)).length).toBe(3)
+  expect(await rowsOf($, 149)).toEqual([BYPASS, RESOURCES, 'cost $1.23 · session 42m', WORKSPACE])
+})
+
+test('两行放不下时先让掉本轮花费和 in/out，仍是两行', async ($, on) => {
+  world(on)
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.session.measure({
+    context: { tokens: 720_000, window: 1_000_000, percent: 72 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 63, resetsAt: new Date(NOW + 165 * 60_000).toISOString() },
+      { kind: 'seven_day', percentUsed: 81, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
+    ],
+    cost: { usd: 1.5 },
+    changed: ['context', 'rateLimits', 'cost'],
+  })
+  await complete($, 't1')
+
+  const head = '◆ Opus 5.5 1M · xhigh │ ctx ▰▰▰▰▰▰▰▱▱▱ 72% 720k/1M │ 5h ▰▰▰▱▱ 63% ↻2h45m · 7d ▰▰▰▰▱ 81% ↻3d · fable ▰▱▱▱▱ 12%'
+  expect((await rowsOf($, 200))[1]).toBe(`${head} │ in 10k · out 2.5k · cache 90% │ cost $1.50 (上轮 +0.27) · session 42m`)
+  const narrower = await rowsOf($, 160)
+  expect(narrower.length).toBe(3)
+  expect(narrower[1]).toBe(`${head} │ cache 90% │ cost $1.50 · session 42m`)
+})
+
+test('进度条一格都填不满时不画，只留百分比', async ($, on) => {
+  world(on, {}, { usage: [usageBody(0)] })
+  await start($)
+  await $.session.measure({
+    context: { tokens: 30_000, window: 1_000_000, percent: 3 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 5, resetsAt: new Date(NOW + 108 * 60_000).toISOString() },
+      { kind: 'seven_day', percentUsed: 1, resetsAt: new Date(NOW + 5 * 86_400_000).toISOString() },
+    ],
+    cost: { usd: 0 },
+    changed: ['context', 'rateLimits', 'cost'],
+  })
+
+  expect((await rowsOf($))[1]).toBe(
+    '◆ Opus 5.5 1M · xhigh │ ctx 3% 30k/1M │ 5h 5% ↻1h48m · 7d 1% · fable 0% │ cost $0.00 · session 42m',
+  )
 })
 
 test('引擎自己那行提示作为子节点时，整棵树仍能通过校验', async ($, on) => {
@@ -270,9 +306,8 @@ test('token 和缓存命中率累计，本轮花费跟在总花费后面', async
   })
   await complete($, 't1')
 
-  const [, , spend] = await rowsOf($)
-  expect(spend).toContain('in 10k · out 2.5k · cache 90%')
-  expect(spend).toContain('cost $1.50 (上轮 +0.27) · session 42m')
+  const [, resources] = await rowsOf($)
+  expect(resources).toContain('in 10k · out 2.5k · cache 90% │ cost $1.50 (上轮 +0.27) · session 42m')
 })
 
 test('子 agent 跑完不会把主对话的本轮当成结束', async ($, on) => {
@@ -281,25 +316,25 @@ test('子 agent 跑完不会把主对话的本轮当成结束', async ($, on) =>
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await complete($, 's1', 'agent-1')
 
-  let [, , , workspace] = await rowsOf($)
+  let [, , workspace] = await rowsOf($)
   expect(workspace).not.toContain('上轮')
   // 子 agent 的 token 也算进会话总量
-  expect((await rowsOf($))[2]).toContain('out 2.5k')
+  expect((await rowsOf($))[1]).toContain('out 2.5k')
 
   await complete($, 't1')
-  ;[, , , workspace] = await rowsOf($)
+  ;[, , workspace] = await rowsOf($)
   expect(workspace).toContain('上轮')
-  expect((await rowsOf($))[2]).toContain('out 5k')
+  expect((await rowsOf($))[1]).toContain('out 5k')
 })
 
 test('Edit / Write 累计改动行数', async ($, on) => {
   world(on)
   await start($)
   await $.tool.call({ tool: 'Edit', file_path: '/repo/a.ts', old_string: 'b', new_string: 'c\nd' })
-  expect((await rowsOf($))[3]).toContain('+2 -1')
+  expect((await rowsOf($))[2]).toContain('+2 -1')
 
   await $.tool.call({ tool: 'Write', file_path: '/repo/b.ts', content: 'x\ny\nz\n' })
-  expect((await rowsOf($))[3]).toContain('+5 -1')
+  expect((await rowsOf($))[2]).toContain('+5 -1')
 })
 
 test('TodoWrite 显示完成进度和正在做的事', async ($, on) => {
@@ -314,7 +349,7 @@ test('TodoWrite 显示完成进度和正在做的事', async ($, on) => {
     ],
   })
 
-  expect((await rowsOf($))[3]).toContain('✓ 1/3 正在写测试')
+  expect((await rowsOf($))[2]).toContain('✓ 1/3 正在写测试')
 })
 
 test('有子 agent 在跑时显示数量', async ($, on) => {
@@ -324,7 +359,7 @@ test('有子 agent 在跑时显示数量', async ($, on) => {
   })
   await start($)
 
-  expect((await rowsOf($))[3]).toContain('◇ 2 agents')
+  expect((await rowsOf($))[2]).toContain('◇ 2 agents')
 })
 
 test('Fable 周额度从 /api/oauth/usage 拿，快用完时带倒计时，隔一阵才再拉', async ($, on) => {
@@ -367,16 +402,16 @@ test('答复里没有 Fable 那条就不显示', async ($, on) => {
   expect((await rowsOf($))[1]).not.toContain('fable')
 })
 
-test('第三行右边：第几轮、上轮耗时、本地时间、版本，时间按分钟走', async ($, on) => {
+test('工作区那行后段：第几轮、上轮耗时、本地时间、版本，时间按分钟走', async ($, on) => {
   const clock = world(on)
   await start($)
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await clock.advance(2000)
   await complete($, 't1')
-  expect((await rowsOf($))[3]).toContain('#12 │ 上轮 2s ⚒0 │ 20:00 │ v2.1.287')
+  expect((await rowsOf($))[2]).toContain('#12 │ 上轮 2s ⚒0 │ 20:00 │ v2.1.287')
 
   await clock.advance(58_000)
-  expect((await rowsOf($))[3]).toContain('20:01')
+  expect((await rowsOf($))[2]).toContain('20:01')
 })
 
 const isDrawn = async ($: Engine) => {

@@ -263,17 +263,18 @@ const formatClock = (at: number, offsetMinutes: number) => {
 const levelColor = (percent: number, warn: number, danger: number) =>
   percent >= danger ? 'red' : percent >= warn ? 'yellow' : 'green'
 
+// 一格都填不满的条只占地方，不画
 const meter = (percent: number, cells: number) => {
   const filled = Math.max(0, Math.min(cells, Math.round((percent / 100) * cells)))
 
-  return `${'▰'.repeat(filled)}${'▱'.repeat(cells - filled)}`
+  return filled ? `${'▰'.repeat(filled)}${'▱'.repeat(cells - filled)}` : null
 }
 
-// ---------- 排版：三行，每行按终端宽度逐级精简 ----------
+// ---------- 排版：宽窗口两行、窄窗口三行，每行再按终端宽度逐级精简 ----------
 
 type Piece = { text: string; color?: string; dim?: boolean; bold?: boolean }
 type Variant = Piece[]
-type Segment = { id: string; side: 'left' | 'right'; variants: Variant[] }
+type Segment = { id: string; variants: Variant[] }
 
 const isWide = (cp: number) =>
   (cp >= 0x1100 && cp <= 0x115f) ||
@@ -318,26 +319,19 @@ const groupWidth = (variants: Variant[]) =>
 // degrade 是放不下时一级一级精简的顺序，靠前的先让步
 const fit = (segments: Segment[], degrade: readonly string[], columns: number) => {
   const level = new Map<string, number>()
-  const pick = (side: Segment['side']) =>
+  const pick = () =>
     segments
-      .filter(s => s.side === side)
       .map(s => s.variants[Math.min(level.get(s.id) ?? 0, s.variants.length - 1)] ?? [])
       .filter(v => v.length > 0)
-  const width = () => {
-    const left = groupWidth(pick('left'))
-    const right = groupWidth(pick('right'))
-
-    return left + right + (left && right ? 2 : 0)
-  }
 
   for (const id of degrade) {
-    if (width() <= columns) {
+    if (groupWidth(pick()) <= columns) {
       break
     }
     level.set(id, (level.get(id) ?? 0) + 1)
   }
 
-  return { left: pick('left'), right: pick('right') }
+  return pick()
 }
 
 // ---------- 各段内容 ----------
@@ -384,14 +378,15 @@ const contextSegment = ({ stats: s }: View): Variant[] => {
   }
   const color = levelColor(percent, 70, 85)
   const label: Piece = { text: 'ctx ', dim: true }
-  const bar: Piece = { text: `${meter(percent, 10)} `, color }
+  const shape = meter(percent, 10)
+  const bar: Piece[] = shape ? [{ text: `${shape} `, color }] : []
   const value: Piece = { text: `${percent}%`, color }
   const used: Piece[] =
     s?.contextTokens != null && s.contextWindow != null
       ? [{ text: ` ${formatTokens(s.contextTokens)}/${formatTokens(s.contextWindow)}`, dim: true }]
       : []
 
-  return [[label, bar, value, ...used], [label, bar, value], [label, value]]
+  return [[label, ...bar, value, ...used], [label, ...bar, value], [label, value]]
 }
 
 const limitPieces = (
@@ -401,10 +396,11 @@ const limitPieces = (
   { bar, reset }: { bar: boolean; reset: boolean },
 ): Piece[] => {
   const color = levelColor(limit.percent, 50, 80)
+  const shape = bar ? meter(limit.percent, 5) : null
 
   return [
     { text: `${label} `, dim: true },
-    ...(bar ? [{ text: `${meter(limit.percent, 5)} `, color }] : []),
+    ...(shape ? [{ text: `${shape} `, color }] : []),
     { text: `${limit.percent}%`, color },
     ...(reset && limit.resetsAt != null && limit.resetsAt > at
       ? [{ text: ` ↻${formatSpan(limit.resetsAt - at)}`, dim: true }]
@@ -574,70 +570,97 @@ const versionSegment = ({ version: v }: View): Variant[] => (v ? [[{ text: `v${v
 
 type Row = { segments: (view: View) => Segment[]; degrade: readonly string[] }
 
-const ROWS: Row[] = [
-  // 第一行：模型、上下文和限额
-  {
-    segments: view => [
-      { id: 'model', side: 'left', variants: modelSegment(view) },
-      { id: 'context', side: 'left', variants: contextSegment(view) },
-      { id: 'limits', side: 'left', variants: limitsSegment(view) },
-    ],
-    degrade: [
-      'context', // 去掉 token 数
-      'limits', // 去掉小进度条
-      'limits', // 去掉重置倒计时
-      'model', // 去掉 effort
-      'limits', // 只留占用最高的那个窗口
-      'context', // 进度条变成纯百分比
-      'limits', // 去掉限额
-      'model', // 模型只留系列名
-    ],
-  },
-  // 第二行：token 和花费
-  {
-    segments: view => [
-      { id: 'tokens', side: 'left', variants: tokensSegment(view) },
-      { id: 'cost', side: 'left', variants: costSegment(view) },
-    ],
-    degrade: [
-      'cost', // 去掉本轮花费
-      'tokens', // 只留缓存命中率
-      'cost', // 去掉会话时长
-      'tokens', // 去掉 token 统计
-      'cost', // 去掉花费
-    ],
-  },
-  // 第三行：工作区和进度（目录、git、改动行数、待办、子 agent、本轮）
-  {
-    segments: view => [
-      { id: 'git', side: 'left', variants: gitSegment(view) },
-      { id: 'diff', side: 'left', variants: diffSegment(view) },
-      { id: 'todos', side: 'left', variants: todosSegment(view) },
-      { id: 'turns', side: 'right', variants: turnsSegment(view) },
-      { id: 'agents', side: 'right', variants: agentsSegment(view) },
-      { id: 'turn', side: 'right', variants: turnSegment(view) },
-      { id: 'clock', side: 'right', variants: clockSegment(view) },
-      { id: 'version', side: 'right', variants: versionSegment(view) },
-    ],
-    degrade: [
-      'todos', // 去掉当前待办的文字
-      'version', // 去掉版本号
-      'git', // 去掉目录名
-      'turn', // 去掉当前工具名
-      'agents', // 子 agent 只留数字
-      'turns', // 去掉第几轮
-      'git', // 去掉未跟踪文件数和 ahead/behind
-      'diff', // 去掉改动行数
-      'turn', // 去掉工具次数
-      'git', // 只留分支名
-      'todos', // 去掉待办
-      'agents', // 去掉子 agent
-      'clock', // 去掉时间
-      'git', // 去掉分支
-      'turn', // 去掉本轮
-    ],
-  },
-]
+// 模型、上下文和限额
+const RESOURCES: Row = {
+  segments: view => [
+    { id: 'model', variants: modelSegment(view) },
+    { id: 'context', variants: contextSegment(view) },
+    { id: 'limits', variants: limitsSegment(view) },
+  ],
+  degrade: [
+    'context', // 去掉 token 数
+    'limits', // 去掉小进度条
+    'limits', // 去掉重置倒计时
+    'model', // 去掉 effort
+    'limits', // 只留占用最高的那个窗口
+    'context', // 进度条变成纯百分比
+    'limits', // 去掉限额
+    'model', // 模型只留系列名
+  ],
+}
+
+// token 和花费
+const SPEND: Row = {
+  segments: view => [
+    { id: 'tokens', variants: tokensSegment(view) },
+    { id: 'cost', variants: costSegment(view) },
+  ],
+  degrade: [
+    'cost', // 去掉本轮花费
+    'tokens', // 只留缓存命中率
+    'cost', // 去掉会话时长
+    'tokens', // 去掉 token 统计
+    'cost', // 去掉花费
+  ],
+}
+
+// 两行时 token 和花费接在模型那行后面，放不下先让细节（本轮花费、in/out、上下文 token 数）
+const RESOURCES_AND_SPEND: Row = {
+  segments: view => [...RESOURCES.segments(view), ...SPEND.segments(view)],
+  degrade: [
+    'cost', // 去掉本轮花费
+    'tokens', // 只留缓存命中率
+    'context', // 去掉 token 数
+    'limits', // 去掉小进度条
+    'limits', // 去掉重置倒计时
+    'cost', // 去掉会话时长
+    'tokens', // 去掉 token 统计
+    'model', // 去掉 effort
+    'limits', // 只留占用最高的那个窗口
+    'context', // 进度条变成纯百分比
+    'limits', // 去掉限额
+    'cost', // 去掉花费
+    'model', // 模型只留系列名
+  ],
+}
+
+// 工作区和进度（目录、git、改动行数、待办），接着第几轮、子 agent、本轮、时间、版本
+const WORKSPACE: Row = {
+  segments: view => [
+    { id: 'git', variants: gitSegment(view) },
+    { id: 'diff', variants: diffSegment(view) },
+    { id: 'todos', variants: todosSegment(view) },
+    { id: 'turns', variants: turnsSegment(view) },
+    { id: 'agents', variants: agentsSegment(view) },
+    { id: 'turn', variants: turnSegment(view) },
+    { id: 'clock', variants: clockSegment(view) },
+    { id: 'version', variants: versionSegment(view) },
+  ],
+  degrade: [
+    'todos', // 去掉当前待办的文字
+    'version', // 去掉版本号
+    'git', // 去掉目录名
+    'turn', // 去掉当前工具名
+    'agents', // 子 agent 只留数字
+    'turns', // 去掉第几轮
+    'git', // 去掉未跟踪文件数和 ahead/behind
+    'diff', // 去掉改动行数
+    'turn', // 去掉工具次数
+    'git', // 只留分支名
+    'todos', // 去掉待办
+    'agents', // 去掉子 agent
+    'clock', // 去掉时间
+    'git', // 去掉分支
+    'turn', // 去掉本轮
+  ],
+}
+
+// 窗口至少这么宽（列数）就画两行；窄了拆成三行，每行能多放些细节。
+// 只看窗口宽度、不看内容长短，免得每轮花费一变 HUD 就在两行三行之间跳
+const TWO_ROWS_MIN_COLUMNS = 150
+
+const layout = (columns: number): Row[] =>
+  columns >= TWO_ROWS_MIN_COLUMNS ? [RESOURCES_AND_SPEND, WORKSPACE] : [RESOURCES, SPEND, WORKSPACE]
 
 // ---------- 刷新 ----------
 
@@ -920,7 +943,7 @@ export const register: Register = on => {
     return { text: hide ? 'HUD 已关闭，输入 /hud 重新打开' : 'HUD 已打开' }
   })
 
-  // 第一行照常是引擎自己的提示（⏵⏵ bypass permissions 等），HUD 另起三行画在它下面
+  // 第一行照常是引擎自己的提示（⏵⏵ bypass permissions 等），HUD 另起两行（窄窗口三行）画在它下面
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const line = await next(e)
     if (await read($, isHidden)) {
@@ -962,10 +985,11 @@ export const register: Register = on => {
       version: v,
       tzOffset: tz,
     }
-    const columns = Math.max(20, (e.viewport?.columns ?? 120) - 4)
-    const rows = ROWS.map(row => fit(row.segments(view), row.degrade, columns)).filter(
-      r => r.left.length > 0 || r.right.length > 0,
-    )
+    const viewportColumns = e.viewport?.columns ?? 120
+    const columns = Math.max(20, viewportColumns - 4)
+    const rows = layout(viewportColumns)
+      .map(row => fit(row.segments(view), row.degrade, columns))
+      .filter(r => r.length > 0)
 
     const draw = (groups: Variant[]) =>
       groups.flatMap((pieces, i) => [
@@ -981,20 +1005,14 @@ export const register: Register = on => {
         )),
       ])
 
-    // 引擎自己的那行不能放在带 width 的 Box 里，否则整棵树会被拒绝，外层只靠 column 拉伸
+    // 引擎自己的那行不能放在带 width 的 Box 里，否则整棵树会被拒绝，外层只靠 column 拉伸。
+    // 每行从左往右连着画，不往右顶：宽屏上贴右边的内容离左边太远，看着像不属于 HUD
     return (
       <Box flexDirection="column">
         {line}
-        {rows.map(({ left, right }) => (
+        {rows.map(groups => (
           <Box width="100%">
-            <Box flexGrow={1} flexShrink={1}>
-              <Text wrap="truncate-end">{draw(left)}</Text>
-            </Box>
-            {right.length > 0 && (
-              <Box flexShrink={0} marginLeft={2}>
-                <Text wrap="truncate-end">{draw(right)}</Text>
-              </Box>
-            )}
+            <Text wrap="truncate-end">{draw(groups)}</Text>
           </Box>
         ))}
       </Box>
