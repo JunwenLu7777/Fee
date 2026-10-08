@@ -1,7 +1,35 @@
 import { atom, memberOf, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionRateLimit, SessionUsage, TurnUsage, UiPressArgument } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit, SessionUsage, ToolCallResult, UiPressArgument } from 'claude-code'
 
 import type { HudActivity, HudDiff, HudGit, HudLimit, HudStats, HudTodo, HudTokens } from '../types'
+
+import { cellWidth, clip, formatElapsed, formatSpan, formatTokens } from './format'
+import {
+  EDIT_TOOLS,
+  SHELL_TOOLS,
+  addUsage,
+  callLabel,
+  costSince,
+  countPatch,
+  defaultView,
+  emptyReceipt,
+  isFailed,
+  matchTurn,
+  pushCall,
+  pushTurn,
+  relativePath,
+  toTurn,
+  withAgentRun,
+  withAgentTool,
+  withCommand,
+  withEdit,
+  withLastCost,
+  withSpawn,
+  withStatuses,
+  withTokens,
+  withToolTime,
+} from './ledger'
+import { drawDetails, receiptPieces } from './details'
 
 const stats = atom({ plugin: 'hud', key: 'stats' } as const, null)
 const modelId = atom({ plugin: 'hud', key: 'modelId' } as const, null)
@@ -22,6 +50,12 @@ const version = atom({ plugin: 'hud', key: 'version' } as const, null)
 const tzOffset = atom({ plugin: 'hud', key: 'tzOffset' } as const, null)
 const answered = { plugin: 'hud', key: 'answered' } as const
 const copiedAt = atom({ plugin: 'hud', key: 'copiedAt' } as const, null)
+const turnLog = atom({ plugin: 'hud', key: 'turnLog' } as const, [])
+const toolStats = atom({ plugin: 'hud', key: 'toolStats' } as const, [])
+const agentLog = atom({ plugin: 'hud', key: 'agentLog' } as const, [])
+const isExpanded = atom({ plugin: 'hud', key: 'isExpanded' } as const, false)
+const detailsView = atom({ plugin: 'hud', key: 'detailsView' } as const, defaultView())
+const toolCalls = atom({ plugin: 'hud', key: 'toolCalls' } as const, [])
 
 const HIDDEN_KEY = 'isHidden'
 // 引擎给插件的 rateLimits 只有 5h / 7d，Fable 的周额度得自己去 /usage 用的接口拿
@@ -128,42 +162,6 @@ const parseGit = (out: string): HudGit | null => {
   return branch ? { branch, changes, untracked, ahead, behind } : null
 }
 
-const addUsage = (t: HudTokens | null, u: TurnUsage): HudTokens => ({
-  input: (t?.input ?? 0) + u.input_tokens,
-  output: (t?.output ?? 0) + u.output_tokens,
-  cacheRead: (t?.cacheRead ?? 0) + u.cache_read_input_tokens,
-  cacheWrite: (t?.cacheWrite ?? 0) + u.cache_creation_input_tokens,
-})
-
-type Hunk = { lines?: unknown }
-
-// Edit / Write 的结果里数 structuredPatch 的 +/- 行；新建文件没有 patch，按内容行数算
-const countPatch = (result: Record<string, unknown>): HudDiff | null => {
-  if (result.staged === true) {
-    return null
-  }
-  const patch = Array.isArray(result.structuredPatch) ? (result.structuredPatch as Hunk[]) : []
-  let added = 0
-  let removed = 0
-  for (const hunk of patch) {
-    for (const line of Array.isArray(hunk.lines) ? hunk.lines : []) {
-      if (typeof line !== 'string') {
-        continue
-      }
-      if (line.startsWith('+')) {
-        added += 1
-      } else if (line.startsWith('-')) {
-        removed += 1
-      }
-    }
-  }
-  if (patch.length === 0 && result.type === 'create' && typeof result.content === 'string') {
-    added = result.content.replace(/\n$/, '').split('\n').length
-  }
-
-  return added || removed ? { added, removed } : null
-}
-
 // 工具成功时的结果对象；被拒、报错或没有结果时为 null
 const okResult = (done: unknown): Record<string, unknown> | null => {
   const r = done as { deny?: unknown; isError?: unknown; result?: unknown }
@@ -229,44 +227,6 @@ const prettyModel = (id: string, window: number | null) => {
 
 // ---------- 格式化 ----------
 
-const formatTokens = (n: number) => {
-  if (n >= 1_000_000) {
-    return `${Math.round(n / 100_000) / 10}M`
-  }
-  if (n >= 10_000) {
-    return `${Math.round(n / 1000)}k`
-  }
-
-  return n >= 1000 ? `${Math.round(n / 100) / 10}k` : `${n}`
-}
-
-// 本轮耗时：12s、3m4s、1h2m
-const formatElapsed = (ms: number) => {
-  const s = Math.max(0, Math.floor(ms / 1000))
-  if (s < 60) {
-    return `${s}s`
-  }
-  if (s < 3600) {
-    return `${Math.floor(s / 60)}m${s % 60}s`
-  }
-
-  return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`
-}
-
-// 会话时长、限额重置倒计时：42m、1h30m、3d4h
-const formatSpan = (ms: number) => {
-  const minutes = Math.max(0, Math.round(ms / 60_000))
-  if (minutes < 60) {
-    return `${minutes}m`
-  }
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) {
-    return minutes % 60 ? `${hours}h${minutes % 60}m` : `${hours}h`
-  }
-
-  return hours % 24 ? `${Math.floor(hours / 24)}d${hours % 24}h` : `${Math.floor(hours / 24)}d`
-}
-
 const formatClock = (at: number, offsetMinutes: number) => {
   const d = new Date(at + offsetMinutes * 60_000)
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -289,40 +249,6 @@ const meter = (percent: number, cells: number) => {
 type Piece = { text: string; color?: string; dim?: boolean; bold?: boolean }
 type Variant = Piece[]
 type Segment = { id: string; variants: Variant[] }
-
-const isWide = (cp: number) =>
-  (cp >= 0x1100 && cp <= 0x115f) ||
-  (cp >= 0x2e80 && cp <= 0xa4cf) ||
-  (cp >= 0xac00 && cp <= 0xd7a3) ||
-  (cp >= 0xf900 && cp <= 0xfaff) ||
-  (cp >= 0xfe30 && cp <= 0xfe4f) ||
-  (cp >= 0xff00 && cp <= 0xff60) ||
-  (cp >= 0xffe0 && cp <= 0xffe6) ||
-  (cp >= 0x1f300 && cp <= 0x1faff)
-
-const cellWidth = (s: string) => {
-  let width = 0
-  for (const ch of s) {
-    width += isWide(ch.codePointAt(0) ?? 0) ? 2 : 1
-  }
-
-  return width
-}
-
-const clip = (s: string, max: number) => {
-  if (cellWidth(s) <= max) {
-    return s
-  }
-  let out = ''
-  for (const ch of s) {
-    if (cellWidth(out + ch) > max - 1) {
-      break
-    }
-    out += ch
-  }
-
-  return `${out}…`
-}
 
 const groupWidth = (variants: Variant[]) =>
   variants.reduce(
@@ -422,12 +348,24 @@ const limitPieces = (
   ]
 }
 
+// 过了重置时间还没有新读数时，旧的百分比已经不作数了（比如歇了一阵回来），按 0% 画
+const live = (limit: HudLimit | null | undefined, at: number): HudLimit | null => {
+  if (!limit) {
+    return null
+  }
+
+  return limit.resetsAt != null && at > 0 && limit.resetsAt <= at ? { percent: 0, resetsAt: null } : limit
+}
+
 const limitsSegment = ({ stats: s, now: at, fable: f }: View): Variant[] => {
+  const fiveHour = live(s?.fiveHour, at)
+  const sevenDay = live(s?.sevenDay, at)
+  const fableWeek = live(f, at)
   const windows = [
-    s?.fiveHour ? { label: '5h', limit: s.fiveHour, showReset: true } : null,
+    fiveHour ? { label: '5h', limit: fiveHour, showReset: true } : null,
     // 周限额只在快用完时才值得看倒计时
-    s?.sevenDay ? { label: '7d', limit: s.sevenDay, showReset: s.sevenDay.percent >= 70 } : null,
-    f ? { label: 'fable', limit: f, showReset: f.percent >= 70 } : null,
+    sevenDay ? { label: '7d', limit: sevenDay, showReset: sevenDay.percent >= 70 } : null,
+    fableWeek ? { label: 'fable', limit: fableWeek, showReset: fableWeek.percent >= 70 } : null,
   ].filter(w => w !== null)
   if (windows.length === 0) {
     return [[]]
@@ -726,7 +664,7 @@ const refreshOffset = async ($: EngineInterface) => {
   await update($, tzOffset, () => found)
 }
 
-// 只在数量变了时才写，免得每次轮询都重画
+// 只在数量或状态变了时才写，免得每次轮询都重画
 const refreshAgents = async ($: EngineInterface) => {
   const list = await $.agent.list().catch(() => null)
   if (!list) {
@@ -735,6 +673,10 @@ const refreshAgents = async ($: EngineInterface) => {
   const running = list.filter(a => a.status === 'running').length
   if (running !== (await read($, agents))) {
     await update($, agents, () => running)
+  }
+  const [at, log] = await Promise.all([$.clock.now(), read($, agentLog)])
+  if (withStatuses(log, list, at) !== log) {
+    await update($, agentLog, current => withStatuses(current, list, at))
   }
 }
 
@@ -820,6 +762,79 @@ const track = async (
   }
 }
 
+// 会话目录，小票里的文件路径写成相对它的；session.start 时记下
+let cwdPath = ''
+
+// 每次工具调用：耗时记进统计；子 agent 的调用记到它名下；这一轮还在跑时，命令和改的文件记进小票。
+// 主对话这一轮跑完后子 agent 还在后台跑的，不再算进任何一轮的小票
+const record = async (
+  $: EngineInterface,
+  e: Record<string, unknown>,
+  name: string,
+  ms: number,
+  done: ToolCallResult | undefined,
+) => {
+  const tool = String(e.tool)
+  const failed = done === undefined || isFailed(done)
+  await update($, toolStats, list => withToolTime(list, name, ms, failed))
+  const turnIndex = (await read($, activity))?.index ?? null
+  await update($, toolCalls, calls =>
+    pushCall(calls, { tool: name, ms, failed, label: callLabel(tool, e, cwdPath), turnIndex }),
+  )
+  const agentId = text(e.agentId)
+  if (agentId) {
+    await update($, agentLog, log => withAgentTool(log, agentId))
+  }
+  const result = failed ? null : okResult(done)
+  const path = text(e.file_path) ?? text(e.notebook_path)
+  await update($, activity, a => {
+    if (!a?.isRunning) {
+      return a
+    }
+    if (SHELL_TOOLS.has(tool)) {
+      return { ...a, receipt: withCommand(a.receipt, text(e.command) ?? '', failed) }
+    }
+    if (EDIT_TOOLS.has(tool) && result && path) {
+      return { ...a, receipt: withEdit(a.receipt, relativePath(path, cwdPath), countPatch(result)) }
+    }
+
+    return a
+  })
+}
+
+// HUD 第一行前面 ▸ 加一个空格的宽度
+const TOGGLE_WIDTH = 2
+
+// 展开时 HUD 下方的明细；最多占终端一半高、20 行
+const detailsOf = async ($: EngineInterface, columns: number, viewportRows: number) => {
+  const [view, log, live, tools, calls, agentsSeen, s, t, at] = await Promise.all([
+    read($, detailsView),
+    read($, turnLog),
+    read($, activity),
+    read($, toolStats),
+    read($, toolCalls),
+    read($, agentLog),
+    read($, stats),
+    read($, tokens),
+    read($, now),
+  ])
+  const isRunning = live?.isRunning === true
+  const data = {
+    view,
+    turns: log,
+    live: isRunning ? live : null,
+    tools,
+    calls,
+    agents: agentsSeen,
+    stats: s,
+    tokens: t,
+    // 这一轮在跑时每秒都有新的耗时，比按分钟走的 now 新
+    now: isRunning ? live.startedAt + live.elapsedMs : (at ?? 0),
+  }
+
+  return { data, size: { columns, rows: Math.max(10, Math.min(20, Math.floor(viewportRows / 2))) } }
+}
+
 const tick = async ($: EngineInterface) => {
   const current = await read($, activity)
   if (!current?.isRunning) {
@@ -851,6 +866,7 @@ export const register: Register = on => {
       $.session.cwd(),
       settingsEffort($),
     ])
+    cwdPath = cwd
     await update($, stats, () => toStats(usage, usage.startedAt))
     await update($, dir, () => shortDir(cwd))
     await update($, effort, current => current ?? configured)
@@ -868,17 +884,23 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     const [startedAt, s] = await Promise.all([$.clock.now(), read($, stats)])
+    const cost = s?.costUsd ?? null
+    // 上一轮的花费算到这一轮开始为止
+    await update($, turnLog, log => withLastCost(log, cost))
+    await refreshTurns($)
+    const index = await read($, turns)
     await update($, activity, () => ({
       turnId: e.turnId,
+      index,
       startedAt,
       elapsedMs: 0,
       tools: 0,
       activeTool: null,
       isRunning: true,
-      costAtStart: s?.costUsd ?? null,
+      costAtStart: cost,
+      receipt: emptyReceipt(),
     }))
     await refreshModel($)
-    await refreshTurns($)
 
     return next(e)
   })
@@ -894,19 +916,23 @@ export const register: Register = on => {
 
   on('tool.call', async ($, e, next) => {
     const name = shortTool(e.tool)
+    const args = e as unknown as Record<string, unknown>
+    const startedAt = await $.clock.now()
     await update($, activity, a => (a?.isRunning ? { ...a, tools: a.tools + 1, activeTool: name } : a))
     if (e.tool === 'Agent') {
       void refreshAgents($)
     }
+    let done: ToolCallResult | undefined
     try {
-      const done = await next(e)
+      done = await next(e)
       const result = okResult(done)
       if (result) {
-        await track($, e.tool, e as unknown as Record<string, unknown>, result)
+        await track($, e.tool, args, result)
       }
 
       return done
     } finally {
+      await record($, args, name, (await $.clock.now()) - startedAt, done)
       await update($, activity, a => (a?.activeTool === name ? { ...a, activeTool: null } : a))
       if (MUTATING_TOOLS.has(e.tool)) {
         void refreshGit($)
@@ -916,12 +942,17 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.usage) {
-      const used = e.usage
+    const used = e.usage
+    const isMain = e.agentId == null
+    if (used) {
       await update($, tokens, t => addUsage(t, used))
+      await update($, activity, a => (a?.isRunning ? { ...a, receipt: withTokens(a.receipt, used, isMain) } : a))
     }
     // 子 agent 每跑完一次也算一个 turn.complete，不能把主对话的本轮当成结束了
     if (e.agentId != null) {
+      const id = e.agentId
+      const ended = await $.clock.now()
+      await update($, agentLog, log => withAgentRun(log, id, used, e.reason, ended, e.answer))
       void refreshAgents($)
 
       return done
@@ -930,10 +961,13 @@ export const register: Register = on => {
     if (answer) {
       await update($, { ...answered, id: hashText(answer) }, () => true)
     }
-    const at = await $.clock.now()
-    await update($, activity, a =>
+    const [at, s] = await Promise.all([$.clock.now(), read($, stats)])
+    const finished = await update($, activity, a =>
       a ? { ...a, isRunning: false, activeTool: null, elapsedMs: at - a.startedAt } : a,
     )
+    if (finished) {
+      await update($, turnLog, log => pushTurn(log, toTurn(finished, e.durationMs, e.reason, s?.costUsd ?? null)))
+    }
     await refreshNow($)
     await refreshGit($)
     await refreshAgents($)
@@ -944,8 +978,66 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     await update($, stats, s => toStats(e, s?.startedAt ?? null))
+    // 正在跑的这一轮实时算花费；两轮之间才到的花费算到上一轮
+    const cost = e.cost?.usd ?? null
+    if (cost != null) {
+      if ((await read($, activity))?.isRunning) {
+        await update($, activity, a =>
+          a?.isRunning ? { ...a, receipt: { ...a.receipt, costUsd: costSince(a.costAtStart, cost) } } : a,
+        )
+      } else {
+        await update($, turnLog, log => withLastCost(log, cost))
+      }
+    }
 
     return next(e)
+  })
+
+  // 起子 agent 时记下它是什么、在第几轮起的
+  on('agent.spawn', async ($, e, next) => {
+    const done = await next(e)
+    if (done.deny === undefined && done.agentId) {
+      const id = done.agentId
+      const [at, a] = await Promise.all([$.clock.now(), read($, activity)])
+      await update($, agentLog, log =>
+        withSpawn(
+          log,
+          {
+            id,
+            type: e.subagentType,
+            description: e.description,
+            model: done.model,
+            turnIndex: a?.index ?? null,
+            startedAt: at,
+          },
+          e.prompt,
+        ),
+      )
+      await update($, activity, x => (x?.isRunning ? { ...x, receipt: { ...x.receipt, agents: x.receipt.agents + 1 } } : x))
+    }
+
+    return done
+  })
+
+  // /clear 和 /resume 换到了另一个会话：引擎的花费、上下文、开始时间都换成新会话的
+  // （measure 不带开始时间，得重新问），自己累计的 token、改动行数、待办和上一轮也清掉，
+  // 不然两边对不上。不放在 session.start 里清：热重载也会触发 session.start，会把正用着的数清掉
+  on('command.run', { command: ['clear', 'resume'] }, async ($, e, next) => {
+    const done = await next(e)
+    const usage = await $.session.usage()
+    await update($, stats, () => toStats(usage, usage.startedAt))
+    await update($, tokens, () => null)
+    await update($, diff, () => null)
+    await update($, todos, () => null)
+    await update($, activity, () => null)
+    await update($, turnLog, () => [])
+    await update($, toolStats, () => [])
+    await update($, agentLog, () => [])
+    await update($, toolCalls, () => [])
+    await update($, detailsView, () => defaultView())
+    await refreshTurns($)
+
+    return done
   })
 
   on('command.run', { command: 'hud' }, async ($, e) => {
@@ -959,6 +1051,39 @@ export const register: Register = on => {
     await $.store.set(HIDDEN_KEY, hide)
 
     return { text: hide ? 'HUD 已关闭，输入 /hud 重新打开' : 'HUD 已打开' }
+  })
+
+  // 每轮结尾那行（✻ … for 1m 14s）下面另起一行写这一轮的小票：花了多少、改了哪些文件、几条命令失败。
+  // 那行只带用时，按用时对上是哪一轮；对不上（比如这次启动前的轮次）就原样画。
+  // 不接在那行后面：引擎那行占满整行宽，接在后面的字会被挤到最右边折成好几行
+  on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
+    const line = await next(e)
+    if (e.surface !== 'terminal') {
+      return line
+    }
+    const turn = matchTurn(await read($, turnLog), e.props.durationMs)
+    const pieces = turn ? receiptPieces(turn.receipt) : []
+    if (pieces.length === 0) {
+      return line
+    }
+
+    const { Box, Text } = $.ui.resolve(e)
+
+    return (
+      <Box flexDirection="column">
+        {line}
+        <Box paddingLeft={2}>
+          <Text wrap="truncate-end">
+            <Text dimColor>{'⎿  '}</Text>
+            {pieces.map(p => (
+              <Text {...(p.color ? { color: p.color } : {})} {...(p.dim ? { dimColor: true } : {})}>
+                {p.text}
+              </Text>
+            ))}
+          </Text>
+        </Box>
+      </Box>
+    )
   })
 
   // 每轮回复的最后一段下面空一行画个暗色的 copy，点了把这段 markdown 放进剪贴板，和 /copy 走同一条路。
@@ -1018,15 +1143,16 @@ export const register: Register = on => {
     )
   })
 
-  // 第一行照常是引擎自己的提示（⏵⏵ bypass permissions 等），HUD 另起两行（窄窗口三行）画在它下面
+  // 第一行照常是引擎自己的提示（⏵⏵ bypass permissions 等），HUD 另起两行（窄窗口三行）画在它下面。
+  // HUD 第一行最前面的 ▸ 点一下在下方展开明细（每轮花费和 token、工具耗时、子 agent），变成 ▾，再点收起
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const line = await next(e)
     if (await read($, isHidden)) {
       return line
     }
 
-    const { Box, Text } = $.ui.resolve(e)
-    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz] = await Promise.all([
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded] = await Promise.all([
       read($, stats),
       read($, modelId),
       read($, effort),
@@ -1042,6 +1168,7 @@ export const register: Register = on => {
       read($, turns),
       read($, version),
       read($, tzOffset),
+      read($, isExpanded),
     ])
     const view: View = {
       stats: s,
@@ -1061,7 +1188,8 @@ export const register: Register = on => {
       tzOffset: tz,
     }
     const viewportColumns = e.viewport?.columns ?? 120
-    const columns = Math.max(20, viewportColumns - 4)
+    // 每行前面留两格给 ▸
+    const columns = Math.max(20, viewportColumns - 4 - TOGGLE_WIDTH)
     const rows = layout(viewportColumns)
       .map(row => fit(row.segments(view), row.degrade, columns))
       .filter(r => r.length > 0)
@@ -1080,16 +1208,35 @@ export const register: Register = on => {
         )),
       ])
 
+    const toggle = (
+      <Box flexShrink={0} marginRight={1}>
+        <Button key="hud:details" plain dimColor onPress={() => void update($, isExpanded, open => !open)}>
+          {expanded ? '▾' : '▸'}
+        </Button>
+      </Box>
+    )
+    const shown = expanded ? await detailsOf($, columns, e.viewport?.rows ?? 40) : null
+    const details = shown
+      ? drawDetails({ Box, Text, Button }, shown.data, shown.size, change => void update($, detailsView, change))
+      : null
+
     // 引擎自己的那行不能放在带 width 的 Box 里，否则整棵树会被拒绝，外层只靠 column 拉伸。
-    // 每行从左往右连着画，不往右顶：宽屏上贴右边的内容离左边太远，看着像不属于 HUD
+    // 每行从左往右连着画，不往右顶：宽屏上贴右边的内容离左边太远，看着像不属于 HUD。
+    // 第一行前面是 ▸，其他行空出同样宽，和第一行对齐
     return (
       <Box flexDirection="column">
         {line}
-        {rows.map(groups => (
-          <Box width="100%">
+        {rows.map((groups, i) => (
+          <Box width="100%" {...(i ? { paddingLeft: TOGGLE_WIDTH } : {})}>
+            {i === 0 && toggle}
             <Text wrap="truncate-end">{draw(groups)}</Text>
           </Box>
         ))}
+        {details && (
+          <Box marginTop={1} paddingLeft={TOGGLE_WIDTH}>
+            {details}
+          </Box>
+        )}
       </Box>
     )
   })
