@@ -15,14 +15,13 @@ import { atom, memberOf, read, update } from 'claude-code'
 import type {
   EngineInterface,
   Register,
-  RenderElement,
   Timer,
   ToolCallResult,
   TurnUsage,
   UiPressArgument,
 } from 'claude-code'
 
-import type { HudDaily, HudFileEdit, HudTodo } from '../types'
+import type { HudChoice, HudDaily, HudFileEdit, HudTodo } from '../types'
 
 import { cellWidth, clip, dayKey, offsetOf } from './format'
 import { alertText, limitWindows } from './forecast'
@@ -31,7 +30,7 @@ import type { Snapshot } from './snapshot'
 import { parseDaily, parseStored } from './spend'
 import { partsOf } from './context'
 import { drawChanges } from './changes'
-import { choiceText, packRows, parseChoices } from './choices'
+import { choiceText, gridOf, parseChoices } from './choices'
 import {
   CACHE_TTL_LONG_MS,
   CACHE_TTL_SHORT_MS,
@@ -752,8 +751,8 @@ const record = async (
 
 // HUD 第一行前面 ▸ 加一个空格的宽度
 const TOGGLE_WIDTH = 2
-// 输入框上方的编号按钮之间空两格
-const CHOICE_GAP = 2
+// 输入框上方的编号按钮，列和列之间空三格
+const CHOICE_GAP = 3
 // HUD 右边几个按钮之间空两格；常用指令窗口不到这么宽就不放，按钮上的字最多这么宽
 const RIGHT_GAP = 2
 const QUICK_MIN_COLUMNS = 90
@@ -1417,7 +1416,8 @@ export const register: Register = (on, options) => {
     )
   })
 
-  // 我回复里让你挑的编号，在输入框上方画成按钮：点选（可以多选），再点「发送」，按点的先后发出去（15、1423）。
+  // 我回复里让你挑的编号，在输入框上方画成按钮：排成整齐的几列，点选（可以多选），再点「发送」，按点的先后发出去（15、1423）。
+  // 编号用主题的强调色，选上的带 ✓；最下面一行固定放「发送」，点选时不跳。
   // 被问卷占着、回合在跑、HUD 关着时不画；你回了话（新的一轮开始）就收掉，点 × 也收掉
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const rest = await next(e)
@@ -1426,52 +1426,50 @@ export const register: Register = (on, options) => {
       return rest
     }
     const { Box, Text, Button } = $.ui.resolve(e)
-    const prefix = '点选（可多选）：'
-    const send = `发送 ${choiceText(sel)}`
-    const cells: { width: number; node: RenderElement }[] = [
-      { width: cellWidth(prefix), node: <Text dimColor>{prefix}</Text> },
-      ...list.items.map(c => {
-        const isOn = sel.includes(c.n)
-        const label = `${isOn ? '●' : '○'} ${c.n} ${c.label}`
+    // 每格一样宽（最宽那项），前面留一格放 ✓
+    const labelOf = (c: HudChoice) => `${sel.includes(c.n) ? '✓' : ' '}${c.n} ${c.label}`
+    const width = Math.max(...list.items.map(c => cellWidth(labelOf(c))))
+    const rows = gridOf(list.items, width, Math.max(20, e.props.bodyColumns), CHOICE_GAP)
+    const cell = (c: HudChoice) => {
+      const isOn = sel.includes(c.n)
 
-        return {
-          width: cellWidth(label),
-          node: (
-            <Button key={`choice:${c.n}`} plain {...(isOn ? {} : { dimColor: true })} onPress={() => void pickChoice($, c.n)}>
-              {label}
-            </Button>
-          ),
-        }
-      }),
-      // 「发送」画成 [ 发送 15 ]，比两边宽 4 格
-      ...(sel.length
-        ? [
-            {
-              width: cellWidth(send) + 4,
-              node: (
-                <Button key="choice:send" variant="primary" onPress={() => void sendChoices($).catch(() => undefined)}>
-                  {send}
-                </Button>
-              ),
-            },
-          ]
-        : []),
-      {
-        width: 1,
-        node: (
-          <Button key="choice:close" plain dimColor role="dismiss" onPress={() => void update($, choices, () => null)}>
-            ×
+      return (
+        <Box width={width}>
+          <Button key={`choice:${c.n}`} plain label={labelOf(c)} onPress={() => void pickChoice($, c.n)}>
+            <Text color="success">{isOn ? '✓' : ' '}</Text>
+            <Text color="suggestion">{String(c.n)}</Text>
+            <Text {...(isOn ? { bold: true } : {})}>{` ${c.label}`}</Text>
           </Button>
-        ),
-      },
-    ]
-    const rows = packRows(cells, Math.max(20, e.props.bodyColumns), CHOICE_GAP)
+        </Box>
+      )
+    }
+    const close = (
+      <Button key="choice:close" plain dimColor role="dismiss" onPress={() => void update($, choices, () => null)}>
+        ×
+      </Button>
+    )
 
     return (
       <Box flexDirection="column">
         {rows.map(r => (
-          <Box columnGap={CHOICE_GAP}>{r.map(c => c.node)}</Box>
+          <Box columnGap={CHOICE_GAP}>{r.map(cell)}</Box>
         ))}
+        {sel.length ? (
+          <Box columnGap={CHOICE_GAP}>
+            <Button key="choice:send" variant="primary" onPress={() => void sendChoices($).catch(() => undefined)}>
+              {`发送 ${choiceText(sel)}`}
+            </Button>
+            <Button key="choice:clear" plain dimColor onPress={() => void update($, picked, () => [])}>
+              清空
+            </Button>
+            {close}
+          </Box>
+        ) : (
+          <Box columnGap={CHOICE_GAP}>
+            <Text dimColor>点编号选上，可以多选</Text>
+            {close}
+          </Box>
+        )}
         {rest}
       </Box>
     )

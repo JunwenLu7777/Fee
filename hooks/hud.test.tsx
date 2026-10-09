@@ -2147,18 +2147,24 @@ test('回复里让你挑的编号画成输入框上方的按钮：点选几个�
 
   const ui = await mountBand($)
   let text = await hudText(ui)
-  expect(text).toContain('点选（可多选）：')
-  expect(text).toContain('○ 1 侧边栏按轮看改动')
-  expect(text).toContain('○ 2 在侧边栏里点文件  ')
-  expect(text).toContain('○ 3 花费上限提醒')
+  // 三项排在一行；最下面一行还没选时是提示
+  expect(text.split('\n')[0]).toMatch(/^ 1 侧边栏按轮看改动\s+ 2 在侧边栏里点文件\s+ 3 花费上限提醒$/)
+  expect(text).toContain('点编号选上，可以多选')
   expect(await ui.find({ type: 'Button', key: 'choice:send' })).toBeUndefined()
 
   await ui.press({ key: 'choice:3' })
   await ui.press({ key: 'choice:1' })
   text = await hudText(ui)
-  expect(text).toContain('● 3 花费上限提醒')
+  expect(text).toContain('✓3 花费上限提醒')
+  expect(text).toContain('✓1 侧边栏按轮看改动')
+  expect(text).not.toContain('点编号选上')
   expect(await ui.find({ type: 'Button', key: 'choice:send' })).toMatchObject({ text: '发送 31' })
 
+  // 清空了重新选
+  await ui.press({ key: 'choice:clear' })
+  expect(await hudText(ui)).toContain('点编号选上，可以多选')
+  await ui.press({ key: 'choice:3' })
+  await ui.press({ key: 'choice:1' })
   await ui.press({ key: 'choice:send' })
   expect(submitted).toEqual(['31'])
   // 你回了话，新的一轮开始，按钮收掉
@@ -2196,15 +2202,15 @@ test('不是让你挑的编号清单不画按钮；回合在跑时不画；点 �
   await complete($, 't1', {
     answer: ['请你帮我看一下：', '', '1. 开关是不是贴着最右边。', '2. 不到 110 列时侧边栏在输入框上方。', '', '如果不对，告诉我。'].join('\n'),
   })
-  expect(await hudText(await mountBand($))).not.toContain('点选')
+  expect(await hudText(await mountBand($))).not.toContain('点编号选上')
 
   await $.turn.start({ text: '接下来做什么', turnId: 't2' })
   await complete($, 't2', { answer: MENU })
-  expect(await hudText(await mountBand($, true))).not.toContain('点选')
+  expect(await hudText(await mountBand($, true))).not.toContain('点编号选上')
   const ui = await mountBand($)
-  expect(await hudText(ui)).toContain('点选')
+  expect(await hudText(ui)).toContain('点编号选上')
   await ui.press({ key: 'choice:close' })
-  expect(await hudText(ui)).not.toContain('点选')
+  expect(await hudText(ui)).not.toContain('点编号选上')
 })
 
 // ---------- 常用指令按钮 ----------
