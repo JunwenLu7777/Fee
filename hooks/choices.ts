@@ -47,3 +47,12 @@ export const parseChoices = (text: string): HudChoice[] => {
 
 // 你点的编号连成要发的话，按点的先后：都是一位数就连着写（15、1423），有两位数的用顿号隔开
 export const choiceText = (picked: readonly number[]) => picked.join(picked.every(n => n < 10) ? '' : '、')
+
+// 一个接一个排，一行放不下就换行；width 是每一个占几格，gap 是中间空几格
+export const packRows = <T extends { width: number }>(cells: readonly T[], width: number, gap: number): T[][] =>
+  cells.reduce<T[][]>((rows, c) => {
+    const row = rows.at(-1)
+    const used = row ? row.reduce((n, x) => n + x.width + gap, 0) : 0
+
+    return row && used + c.width <= width ? [...rows.slice(0, -1), [...row, c]] : [...rows, [c]]
+  }, [])

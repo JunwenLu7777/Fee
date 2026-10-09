@@ -1,45 +1,41 @@
+// HUD 插件的入口。Claude Code 规定 $（读写状态、跑命令、画界面都靠它）只能传给同一个文件里的函数，
+// 所以用到 $ 的代码都在这个文件里；不碰 $ 的放在别的文件：
+//   config.ts    /config 里的设置              parse.ts     把引擎、git、接口给的数据整理好
+//   segments.ts  HUD 每一段写什么、怎么排      details.tsx  明细怎么画
+//   changes.tsx  改动侧边栏怎么画              ledger.ts    小票、工具耗时、子 agent 的记账
+//   forecast.ts  额度什么时候用完              spend.ts     每天花费（ccusage 的输出）
+//   context.ts   上下文里装了什么              choices.ts   回复里让你挑的编号
+//   snapshot.ts  git 快照的脚本和输出          format.ts    数字、时长、终端宽度、本地时间
+//
+// 这个文件从上往下：记在会话里的值 → git 分支状态 → 改动行数（git 快照对比）→ 改动侧边栏 → 刷新 →
+// 额度 → 每天花费 → 工具调用记账 → HUD 和明细 → 缓存 → 离开时续缓存 → 按钮替你发的话 → 本轮计时 →
+// 挂 hook（每个事件做什么）
+
 import { atom, memberOf, read, update } from 'claude-code'
 import type {
   EngineInterface,
-  PluginOptions,
   Register,
   RenderElement,
-  SessionRateLimit,
-  SessionUsage,
   Timer,
   ToolCallResult,
   TurnUsage,
   UiPressArgument,
 } from 'claude-code'
 
-import type {
-  HudActivity,
-  HudDaily,
-  HudWarm,
-  HudDiff,
-  HudFileEdit,
-  HudGit,
-  HudLimit,
-  HudStats,
-  HudTodo,
-  HudTokens,
-} from '../types'
+import type { HudDaily, HudFileEdit, HudTodo } from '../types'
 
-import { cellWidth, clip, dayKey, formatClock, formatElapsed, formatSpan, formatTokens, formatWhen } from './format'
-import { MIN_ELAPSED_SHARE, alertText, limitWindows } from './forecast'
-import type { LimitWindow } from './forecast'
+import { cellWidth, clip, dayKey, offsetOf } from './format'
+import { alertText, limitWindows } from './forecast'
 import { SNAPSHOT_SCRIPT, parseNumstat, parseSnapshot } from './snapshot'
 import type { Snapshot } from './snapshot'
 import { parseDaily, parseStored } from './spend'
 import { partsOf } from './context'
 import { drawChanges } from './changes'
-import { choiceText, parseChoices } from './choices'
+import { choiceText, packRows, parseChoices } from './choices'
 import {
   CACHE_TTL_LONG_MS,
   CACHE_TTL_SHORT_MS,
   EDIT_TOOLS,
-  LOOP_EDITS,
-  LOOP_FAILS,
   SHELL_TOOLS,
   addUsage,
   bump,
@@ -71,8 +67,25 @@ import {
   withTokens,
   withToolTime,
 } from './ledger'
-import type { CompactForecast } from './ledger'
 import { drawDetails, receiptPieces } from './details'
+import { config, forecastShare, readConfig } from './config'
+import {
+  hashText,
+  okResult,
+  parseFable,
+  parseGit,
+  parseOffset,
+  shortDir,
+  shortTool,
+  text,
+  toStats,
+  toTodos,
+  todoStatus,
+} from './parse'
+import { SEP, fit, layout } from './segments'
+import type { Variant, View } from './segments'
+
+// ---------- 记在会话里的值（$.state，每个都在 types/index.d.ts 里声明过）和几个常量 ----------
 
 const stats = atom({ plugin: 'hud', key: 'stats' } as const, null)
 const modelId = atom({ plugin: 'hud', key: 'modelId' } as const, null)
@@ -130,636 +143,8 @@ const COPIED_MS = 1500
 const ALERT_MS = 8000
 // 这些工具跑完可能改了文件，跑完顺手刷新 git 状态和改动行数
 const MUTATING_TOOLS = new Set([...EDIT_TOOLS, ...SHELL_TOOLS])
-const SPINNER = ['◐', '◓', '◑', '◒']
-const SEP = ' │ '
 
-// ---------- /config 里能改的几个门槛（plugin.json 的 userConfig），没设就用默认值 ----------
-
-type Config = {
-  // 同一条命令连着失败几次、同一个文件一轮里改几次提醒原地打转；0 不提醒
-  loopFails: number
-  loopEdits: number
-  // 额度照现在的速度会提前用完时弹不弹提示（HUD 上照样写）
-  limitAlert: boolean
-  // 额度窗口过了百分之几才开始预测
-  forecastAfter: number
-  // 还能撑几轮以内才在 HUD 上写「约 N 轮后压缩」；0 不写
-  compactTurns: number
-  // HUD 最后一行右边的常用指令，点一下就发出去
-  quickPrompts: string[]
-  // 离开时最多续几次缓存（订阅账号每次续 1 小时）；0 不续
-  keepWarmTimes: number
-}
-
-const DEFAULT_CONFIG: Config = {
-  loopFails: LOOP_FAILS,
-  loopEdits: LOOP_EDITS,
-  limitAlert: true,
-  forecastAfter: MIN_ELAPSED_SHARE * 100,
-  compactTurns: 10,
-  quickPrompts: ['提交+push', '接下来做什么'],
-  keepWarmTimes: 3,
-}
-
-let config = DEFAULT_CONFIG
-const QUICK_MAX = 6
-
-// 设置里存的可能是数字也可能是字符串；不是数就用默认值，超出范围的截到范围里
-const numberOption = (v: unknown, fallback: number, max: number) => {
-  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN
-
-  return Number.isFinite(n) ? Math.max(0, Math.min(max, Math.round(n))) : fallback
-}
-
-const readConfig = (o: PluginOptions): Config => ({
-  loopFails: numberOption(o.loopFails, DEFAULT_CONFIG.loopFails, 100),
-  loopEdits: numberOption(o.loopEdits, DEFAULT_CONFIG.loopEdits, 1000),
-  limitAlert: typeof o.limitAlert === 'boolean' ? o.limitAlert : DEFAULT_CONFIG.limitAlert,
-  forecastAfter: numberOption(o.forecastAfter, DEFAULT_CONFIG.forecastAfter, 90),
-  compactTurns: numberOption(o.compactTurns, DEFAULT_CONFIG.compactTurns, 100),
-  // 用 | 隔开；留空就不放
-  quickPrompts:
-    typeof o.quickPrompts === 'string'
-      ? o.quickPrompts
-          .split('|')
-          .map(t => t.trim())
-          .filter(Boolean)
-          .slice(0, QUICK_MAX)
-      : DEFAULT_CONFIG.quickPrompts,
-  keepWarmTimes: numberOption(o.keepWarmTimes, DEFAULT_CONFIG.keepWarmTimes, 10),
-})
-
-const forecastShare = () => config.forecastAfter / 100
-
-// ---------- 数据整理 ----------
-
-const toLimit = (limits: readonly SessionRateLimit[], kind: string): HudLimit | null => {
-  const found = limits.find(r => r.kind === kind)
-  if (!found) {
-    return null
-  }
-  const resetsAt = found.resetsAt ? Date.parse(found.resetsAt) : NaN
-
-  return { percent: found.percentUsed, resetsAt: Number.isNaN(resetsAt) ? null : resetsAt }
-}
-
-const toStats = (
-  u: Pick<SessionUsage, 'context' | 'rateLimits' | 'cost'>,
-  startedAt: number | null,
-): HudStats => ({
-  contextPercent: u.context.percent ?? null,
-  contextTokens: u.context.tokens ?? null,
-  contextWindow: u.context.window || null,
-  costUsd: u.cost?.usd ?? null,
-  startedAt,
-  fiveHour: toLimit(u.rateLimits, 'five_hour'),
-  sevenDay: toLimit(u.rateLimits, 'seven_day'),
-})
-
-type UsageLimit = { percent?: unknown; resets_at?: unknown; scope?: { model?: { display_name?: unknown } | null } | null }
-
-// limits[] 里按模型分的周额度，scope.model.display_name 是 Fable 的那条；有多条取占用最高的
-const parseFable = (body: string): HudLimit | null => {
-  let data: unknown
-  try {
-    data = JSON.parse(body)
-  } catch {
-    return null
-  }
-  const limits = (data as { limits?: unknown } | null)?.limits
-  const found = (Array.isArray(limits) ? limits : []).flatMap((item: unknown) => {
-    const l = (item ?? {}) as UsageLimit
-    const name = l.scope?.model?.display_name
-
-    return typeof name === 'string' && /fable/i.test(name) && typeof l.percent === 'number'
-      ? [{ percent: l.percent, resetsAt: l.resets_at }]
-      : []
-  })
-  if (found.length === 0) {
-    return null
-  }
-  const top = found.reduce((a, b) => (b.percent > a.percent ? b : a))
-  const resetsAt =
-    typeof top.resetsAt === 'number'
-      ? top.resetsAt * 1000
-      : typeof top.resetsAt === 'string'
-        ? Date.parse(top.resetsAt)
-        : NaN
-
-  return { percent: Math.round(top.percent), resetsAt: Number.isNaN(resetsAt) ? null : resetsAt }
-}
-
-// date +%z 的输出：+0800 → 480
-const parseOffset = (out: string): number | null => {
-  const m = out.trim().match(/^([+-])(\d{2})(\d{2})$/)
-
-  return m ? (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : null
-}
-
-const parseGit = (out: string): HudGit | null => {
-  let branch = ''
-  let oid = ''
-  let ahead = 0
-  let behind = 0
-  let changes = 0
-  let untracked = 0
-  for (const line of out.split('\n')) {
-    if (line.startsWith('# branch.head ')) {
-      branch = line.slice('# branch.head '.length)
-    } else if (line.startsWith('# branch.oid ')) {
-      oid = line.slice('# branch.oid '.length)
-    } else if (line.startsWith('# branch.ab ')) {
-      const m = line.match(/\+(\d+) -(\d+)/)
-      ahead = Number(m?.[1] ?? 0)
-      behind = Number(m?.[2] ?? 0)
-    } else if (line.startsWith('? ')) {
-      untracked += 1
-    } else if (line !== '' && !line.startsWith('#')) {
-      changes += 1
-    }
-  }
-  if (branch === '(detached)') {
-    branch = oid.slice(0, 7)
-  }
-
-  return branch ? { branch, changes, untracked, ahead, behind } : null
-}
-
-// 工具成功时的结果对象；被拒、报错或没有结果时为 null
-const okResult = (done: unknown): Record<string, unknown> | null => {
-  const r = done as { deny?: unknown; isError?: unknown; result?: unknown }
-  if (r.deny !== undefined || r.isError === true) {
-    return null
-  }
-
-  return r.result && typeof r.result === 'object' ? (r.result as Record<string, unknown>) : null
-}
-
-const TODO_STATUSES = ['pending', 'in_progress', 'completed'] as const
-
-const text = (v: unknown) => (typeof v === 'string' && v !== '' ? v : null)
-
-const todoStatus = (v: unknown): HudTodo['status'] | null => TODO_STATUSES.find(s => s === v) ?? null
-
-const toTodos = (raw: unknown): HudTodo[] =>
-  (Array.isArray(raw) ? raw : []).flatMap((item: unknown, i) => {
-    const t = (item ?? {}) as Record<string, unknown>
-    const status = todoStatus(t.status)
-
-    return status ? [{ id: String(i), status, label: text(t.activeForm) ?? text(t.content) ?? '' }] : []
-  })
-
-// FNV-1a 加上长度，只用来认出同一段回复
-const hashText = (s: string) => {
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i += 1) {
-    h ^= s.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-
-  return `${s.length}:${(h >>> 0).toString(36)}`
-}
-
-const shortDir = (cwd: string) => {
-  if (/^\/(Users|home)\/[^/]+\/?$/.test(cwd)) {
-    return '~'
-  }
-
-  return cwd.split('/').filter(Boolean).pop() ?? '/'
-}
-
-const shortTool = (tool: string) => {
-  const name = tool.startsWith('mcp__') ? (tool.split('__').pop() ?? tool) : tool
-
-  return name.length > 16 ? `${name.slice(0, 15)}…` : name
-}
-
-const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
-
-// claude-opus-5-5 → Opus 5.5，claude-haiku-4-5-20251001 → Haiku 4.5，带 [1m] 或窗口 ≥1M 的加上 1M
-const prettyModel = (id: string, window: number | null) => {
-  const isLong = /\[1m\]/i.test(id) || (window ?? 0) >= 1_000_000
-  const base = id.replace(/\[1m\]/i, '')
-  const m = base.match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/)
-  const family = m?.[1] ? capitalize(m[1]) : null
-  const version = m?.[2] ? `${m[2]}${m[3] ? `.${m[3]}` : ''}` : ''
-  const name = family ? `${family} ${version}` : base.replace(/^claude-/, '')
-
-  return { full: isLong ? `${name} 1M` : name, short: family ?? name }
-}
-
-// ---------- 格式化 ----------
-
-const levelColor = (percent: number, warn: number, danger: number) =>
-  percent >= danger ? 'red' : percent >= warn ? 'yellow' : 'green'
-
-const SEVERITY = ['green', 'yellow', 'red']
-
-// 两个颜色里更严重的那个
-const worse = (a: string, b: string) => (SEVERITY.indexOf(a) >= SEVERITY.indexOf(b) ? a : b)
-
-// 一格都填不满的条只占地方，不画
-const meter = (percent: number, cells: number) => {
-  const filled = Math.max(0, Math.min(cells, Math.round((percent / 100) * cells)))
-
-  return filled ? `${'▰'.repeat(filled)}${'▱'.repeat(cells - filled)}` : null
-}
-
-// ---------- 排版：宽窗口两行、窄窗口三行，每行再按终端宽度逐级精简 ----------
-
-type Piece = { text: string; color?: string; dim?: boolean; bold?: boolean }
-type Variant = Piece[]
-type Segment = { id: string; variants: Variant[] }
-
-const groupWidth = (variants: Variant[]) =>
-  variants.reduce(
-    (width, v, i) => width + (i ? SEP.length : 0) + v.reduce((w, p) => w + cellWidth(p.text), 0),
-    0,
-  )
-
-// degrade 是放不下时一级一级精简的顺序，靠前的先让步
-const fit = (segments: Segment[], degrade: readonly string[], columns: number) => {
-  const level = new Map<string, number>()
-  const pick = () =>
-    segments
-      .map(s => s.variants[Math.min(level.get(s.id) ?? 0, s.variants.length - 1)] ?? [])
-      .filter(v => v.length > 0)
-
-  for (const id of degrade) {
-    if (groupWidth(pick()) <= columns) {
-      break
-    }
-    level.set(id, (level.get(id) ?? 0) + 1)
-  }
-
-  return pick()
-}
-
-// ---------- 各段内容 ----------
-
-type View = {
-  stats: HudStats | null
-  modelId: string | null
-  effort: string | null
-  git: HudGit | null
-  dir: string | null
-  activity: HudActivity | null
-  now: number
-  tokens: HudTokens | null
-  diff: HudDiff | null
-  todos: HudTodo[] | null
-  agents: number
-  fable: HudLimit | null
-  turns: number | null
-  version: string | null
-  tzOffset: number | null
-  // 照最近几轮的涨法，还能撑几轮到自动压缩
-  compact: CompactForecast | null
-  // 离开时续缓存续了几次
-  warm: HudWarm | null
-}
-
-const DOT: Piece = { text: ' · ', dim: true }
-
-// 约 4 轮后压缩：一轮以内标红，三轮以内标黄；还能撑很多轮的不占地方（几轮以内才写，/config 里能改）
-const compactPieces = (c: CompactForecast | null): Piece[] => {
-  if (!c || config.compactTurns === 0 || c.turnsLeft > config.compactTurns) {
-    return []
-  }
-  const tone = c.turnsLeft <= 1 ? { color: 'red' } : c.turnsLeft <= 3 ? { color: 'yellow' } : { dim: true }
-
-  return [{ text: c.turnsLeft === 0 ? ' 快压缩了' : ` 约${c.turnsLeft}轮后压缩`, ...tone }]
-}
-
-const modelSegment = ({ modelId: id, effort: level, stats: s }: View): Variant[] => {
-  if (!id) {
-    return [[]]
-  }
-  const { full, short } = prettyModel(id, s?.contextWindow ?? null)
-  const icon: Piece = { text: '◆ ', color: 'magenta' }
-  const name = (text: string): Piece => ({ text, color: 'magenta', bold: true })
-
-  return [
-    [icon, name(full), ...(level ? [{ text: ` · ${level}`, dim: true }] : [])],
-    [icon, name(full)],
-    [icon, name(short)],
-  ]
-}
-
-const contextSegment = ({ stats: s, compact: c }: View): Variant[] => {
-  const percent = s?.contextPercent
-  if (percent == null) {
-    return [[]]
-  }
-  const soon = compactPieces(c)
-  const color = levelColor(percent, 70, 85)
-  const label: Piece = { text: 'ctx ', dim: true }
-  const shape = meter(percent, 10)
-  const bar: Piece[] = shape ? [{ text: `${shape} `, color }] : []
-  const value: Piece = { text: `${percent}%`, color }
-  const used: Piece[] =
-    s?.contextTokens != null && s.contextWindow != null
-      ? [{ text: ` ${formatTokens(s.contextTokens)}/${formatTokens(s.contextWindow)}`, dim: true }]
-      : []
-
-  return [
-    [label, ...bar, value, ...used, ...soon],
-    [label, ...bar, value, ...soon],
-    [label, value, ...soon],
-  ]
-}
-
-// 照现在的速度重置前就会用完的，百分比至少变黄，后面跟上约几点用完；快到了标红
-const limitPieces = (
-  w: LimitWindow,
-  at: number,
-  offset: number,
-  { bar, reset }: { bar: boolean; reset: boolean },
-): Piece[] => {
-  const { limit, forecast } = w
-  const warn = forecast ? (forecast.isUrgent ? 'red' : 'yellow') : 'green'
-  const color = worse(levelColor(limit.percent, 50, 80), warn)
-  const shape = bar ? meter(limit.percent, 5) : null
-
-  return [
-    { text: `${w.label} `, dim: true },
-    ...(shape ? [{ text: `${shape} `, color }] : []),
-    { text: `${limit.percent}%`, color },
-    ...(reset && limit.resetsAt != null && limit.resetsAt > at
-      ? [{ text: ` ↻${formatSpan(limit.resetsAt - at)}`, dim: true }]
-      : []),
-    ...(forecast ? [{ text: ` 约${formatWhen(forecast.runOutAt, at, offset)}用完`, color: warn }] : []),
-  ]
-}
-
-// 插件环境里的 Date 不一定是本机时区，优先用启动时问到的偏移
-const offsetOf = (tz: number | null, at: number) => tz ?? -new Date(at).getTimezoneOffset()
-
-const limitsSegment = ({ stats: s, now: at, fable: f, tzOffset: tz }: View): Variant[] => {
-  const windows = limitWindows(s, f, at, forecastShare()).map(w => ({
-    ...w,
-    // 周限额只在快用完、或者照现在的速度会提前用完时才值得看倒计时
-    showReset: w.label === '5h' || w.limit.percent >= 70 || w.forecast != null,
-  }))
-  if (windows.length === 0) {
-    return [[]]
-  }
-  const offset = offsetOf(tz, at)
-  const join = (parts: Piece[][]) => parts.flatMap((p, i) => (i ? [DOT, ...p] : p))
-  const all = (bar: boolean, withReset: boolean) =>
-    join(windows.map(w => limitPieces(w, at, offset, { bar, reset: withReset && w.showReset })))
-  // 只放得下一个时：有会提前用完的，留最先用完的那个；没有就留占用最高的
-  const soonest = windows
-    .flatMap(w => (w.forecast ? [{ w, runOutAt: w.forecast.runOutAt }] : []))
-    .sort((a, b) => a.runOutAt - b.runOutAt)[0]?.w
-  const highest = soonest ?? windows.reduce((a, b) => (b.limit.percent > a.limit.percent ? b : a))
-
-  return [
-    all(true, true),
-    all(false, true),
-    all(false, false),
-    limitPieces(highest, at, offset, { bar: false, reset: false }),
-    [],
-  ]
-}
-
-const tokensSegment = ({ tokens: t }: View): Variant[] => {
-  if (!t) {
-    return [[]]
-  }
-  // in 算上缓存读写，是真正发给模型的输入量
-  const total = t.input + t.cacheRead + t.cacheWrite
-  const out: Piece[] = [
-    { text: 'in ', dim: true },
-    { text: formatTokens(total) },
-    DOT,
-    { text: 'out ', dim: true },
-    { text: formatTokens(t.output) },
-  ]
-  if (total === 0) {
-    return [out, out, []]
-  }
-  const hit = Math.round((t.cacheRead / total) * 100)
-  const cache: Piece[] = [
-    { text: 'cache ', dim: true },
-    { text: `${hit}%`, color: hit >= 70 ? 'green' : hit >= 40 ? 'yellow' : 'red' },
-  ]
-
-  return [[...out, DOT, ...cache], cache, []]
-}
-
-// cost 是本会话累计（/cost 的数），括号里是本轮（或上一轮）花的；session 是从开会话到现在的时长
-const costSegment = ({ stats: s, activity: a, now: at }: View): Variant[] => {
-  const usd = s?.costUsd
-  const cost: Piece[] = usd != null ? [{ text: 'cost ', dim: true }, { text: `$${usd.toFixed(2)}` }] : []
-  const delta = usd != null && a?.costAtStart != null ? usd - a.costAtStart : 0
-  const turn: Piece[] =
-    delta >= 0.005 ? [{ text: ` (${a?.isRunning ? '本轮' : '上轮'} +${delta.toFixed(2)})`, dim: true }] : []
-  const span = s?.startedAt != null && at > s.startedAt ? formatSpan(at - s.startedAt) : null
-  const duration: Piece[] = span
-    ? [...(cost.length ? [DOT] : []), { text: 'session ', dim: true }, { text: span }]
-    : []
-
-  return [[...cost, ...turn, ...duration], [...cost, ...duration], cost, []]
-}
-
-const gitSegment = ({ git: g, dir: d }: View): Variant[] => {
-  const folder: Piece[] = d ? [{ text: d, color: 'blue', bold: true }] : []
-  if (!g) {
-    return [folder, []]
-  }
-  const branch: Piece = { text: `⎇ ${g.branch}`, color: 'cyan' }
-  const changes: Piece[] = g.changes ? [{ text: ` ±${g.changes}`, color: 'yellow' }] : []
-  const untracked: Piece[] = g.untracked ? [{ text: ` ?${g.untracked}`, color: 'yellow', dim: true }] : []
-  const sync = `${g.ahead ? `↑${g.ahead}` : ''}${g.behind ? `↓${g.behind}` : ''}`
-  const ab: Piece[] = sync ? [{ text: ` ${sync}`, color: 'cyan', dim: true }] : []
-  const gap: Piece[] = folder.length ? [{ text: ' ' }] : []
-
-  return [
-    [...folder, ...gap, branch, ...changes, ...untracked, ...ab],
-    [branch, ...changes, ...untracked, ...ab],
-    [branch, ...changes],
-    [branch],
-    [],
-  ]
-}
-
-const diffSegment = ({ diff: d }: View): Variant[] => {
-  if (!d || (d.added === 0 && d.removed === 0)) {
-    return [[]]
-  }
-
-  return [
-    [
-      { text: `+${formatTokens(d.added)}`, color: 'green' },
-      { text: ' ' },
-      { text: `-${formatTokens(d.removed)}`, color: 'red' },
-    ],
-    [],
-  ]
-}
-
-const todosSegment = ({ todos: list }: View): Variant[] => {
-  if (!list?.length) {
-    return [[]]
-  }
-  const done = list.filter(t => t.status === 'completed').length
-  const color = done === list.length ? 'green' : 'cyan'
-  const count: Piece[] = [{ text: `✓ ${done}/${list.length}`, color }]
-  const active = list.find(t => t.status === 'in_progress')
-  const label: Piece[] = active ? [{ text: ` ${clip(active.label, 28)}`, dim: true }] : []
-
-  return [[...count, ...label], count, []]
-}
-
-const agentsSegment = ({ agents: n }: View): Variant[] => {
-  if (!n) {
-    return [[]]
-  }
-
-  return [
-    [{ text: `◇ ${n} agent${n > 1 ? 's' : ''}`, color: 'yellow' }],
-    [{ text: `◇${n}`, color: 'yellow' }],
-    [],
-  ]
-}
-
-const turnSegment = ({ activity: a }: View): Variant[] => {
-  if (!a) {
-    return [[]]
-  }
-  const elapsed = formatElapsed(a.elapsedMs)
-  const tools: Piece = { text: ` ⚒${a.tools}`, dim: true }
-  if (!a.isRunning) {
-    const done: Piece = { text: `上轮 ${elapsed}`, dim: true }
-
-    return [[done, tools], [done, tools], [done], []]
-  }
-  const spin: Piece = {
-    text: `${SPINNER[Math.floor(a.elapsedMs / 1000) % SPINNER.length]} `,
-    color: 'yellow',
-  }
-  const tool: Piece[] = a.activeTool ? [{ text: `${a.activeTool} `, color: 'yellow', bold: true }] : []
-  const time: Piece = { text: elapsed, color: 'yellow' }
-
-  return [[spin, ...tool, time, tools], [spin, time, tools], [spin, time, tools], [spin, time]]
-}
-
-// 你离开时续过缓存：缓存已续 1/3；这一轮在跑、还没续过时不写
-const warmSegment = ({ warm: w, activity: a }: View): Variant[] =>
-  w && w.refreshes > 0 && !a?.isRunning
-    ? [[{ text: `缓存已续 ${w.refreshes}/${Math.max(w.refreshes, config.keepWarmTimes)}`, dim: true }], []]
-    : [[]]
-
-// 第几轮：本会话里发了几条消息
-const turnsSegment = ({ turns: n }: View): Variant[] => (n ? [[{ text: `#${n}`, dim: true }], []] : [[]])
-
-const clockSegment = ({ now: at, tzOffset: tz }: View): Variant[] => {
-  if (!at) {
-    return [[]]
-  }
-  return [[{ text: formatClock(at, offsetOf(tz, at)) }], []]
-}
-
-const versionSegment = ({ version: v }: View): Variant[] => (v ? [[{ text: `v${v}`, dim: true }], []] : [[]])
-
-type Row = { segments: (view: View) => Segment[]; degrade: readonly string[] }
-
-// 模型、上下文和限额
-const RESOURCES: Row = {
-  segments: view => [
-    { id: 'model', variants: modelSegment(view) },
-    { id: 'context', variants: contextSegment(view) },
-    { id: 'limits', variants: limitsSegment(view) },
-  ],
-  degrade: [
-    'context', // 去掉 token 数
-    'limits', // 去掉小进度条
-    'limits', // 去掉重置倒计时
-    'model', // 去掉 effort
-    'limits', // 只留占用最高的那个窗口
-    'context', // 进度条变成纯百分比
-    'limits', // 去掉限额
-    'model', // 模型只留系列名
-  ],
-}
-
-// token 和花费
-const SPEND: Row = {
-  segments: view => [
-    { id: 'tokens', variants: tokensSegment(view) },
-    { id: 'cost', variants: costSegment(view) },
-  ],
-  degrade: [
-    'cost', // 去掉本轮花费
-    'tokens', // 只留缓存命中率
-    'cost', // 去掉会话时长
-    'tokens', // 去掉 token 统计
-    'cost', // 去掉花费
-  ],
-}
-
-// 两行时 token 和花费接在模型那行后面，放不下先让细节（本轮花费、in/out、上下文 token 数）
-const RESOURCES_AND_SPEND: Row = {
-  segments: view => [...RESOURCES.segments(view), ...SPEND.segments(view)],
-  degrade: [
-    'cost', // 去掉本轮花费
-    'tokens', // 只留缓存命中率
-    'context', // 去掉 token 数
-    'limits', // 去掉小进度条
-    'limits', // 去掉重置倒计时
-    'cost', // 去掉会话时长
-    'tokens', // 去掉 token 统计
-    'model', // 去掉 effort
-    'limits', // 只留占用最高的那个窗口
-    'context', // 进度条变成纯百分比
-    'limits', // 去掉限额
-    'cost', // 去掉花费
-    'model', // 模型只留系列名
-  ],
-}
-
-// 工作区和进度（目录、git、改动行数、待办），接着第几轮、子 agent、本轮、时间、版本
-const WORKSPACE: Row = {
-  segments: view => [
-    { id: 'git', variants: gitSegment(view) },
-    { id: 'diff', variants: diffSegment(view) },
-    { id: 'todos', variants: todosSegment(view) },
-    { id: 'turns', variants: turnsSegment(view) },
-    { id: 'agents', variants: agentsSegment(view) },
-    { id: 'turn', variants: turnSegment(view) },
-    { id: 'warm', variants: warmSegment(view) },
-    { id: 'clock', variants: clockSegment(view) },
-    { id: 'version', variants: versionSegment(view) },
-  ],
-  degrade: [
-    'todos', // 去掉当前待办的文字
-    'warm', // 去掉续缓存的次数
-    'version', // 去掉版本号
-    'git', // 去掉目录名
-    'turn', // 去掉当前工具名
-    'agents', // 子 agent 只留数字
-    'turns', // 去掉第几轮
-    'git', // 去掉未跟踪文件数和 ahead/behind
-    'diff', // 去掉改动行数
-    'turn', // 去掉工具次数
-    'git', // 只留分支名
-    'todos', // 去掉待办
-    'agents', // 去掉子 agent
-    'clock', // 去掉时间
-    'git', // 去掉分支
-    'turn', // 去掉本轮
-  ],
-}
-
-// 窗口至少这么宽（列数）就画两行；窄了拆成三行，每行能多放些细节。
-// 只看窗口宽度、不看内容长短，免得每轮花费一变 HUD 就在两行三行之间跳
-const TWO_ROWS_MIN_COLUMNS = 150
-
-const layout = (columns: number): Row[] =>
-  columns >= TWO_ROWS_MIN_COLUMNS ? [RESOURCES_AND_SPEND, WORKSPACE] : [RESOURCES, SPEND, WORKSPACE]
-
-// ---------- 刷新 ----------
+// ---------- git 分支状态 ----------
 
 let isGitRefreshing = false
 
@@ -890,6 +275,8 @@ const refreshChanges = ($: EngineInterface) => {
   return changesRun
 }
 
+// ---------- 改动侧边栏：看哪一段、点开的文件、开和关 ----------
+
 // 侧边栏看的是哪一段：整个会话（会话开始 → 最近一张快照），或者某一轮（那一轮开始 → 结束，还在跑的到最近一张）
 type ChangesRange = {
   from: string | null
@@ -1019,6 +406,8 @@ const openChanges = async ($: EngineInterface, turnId?: string) => {
   await update($, isChangesUp, () => opened.isPlaced)
 }
 
+// ---------- 刷新：上下文、模型、时间、第几轮、版本、时区、子 agent、设置里的 effort ----------
+
 // 上下文里装了什么、到多少自动压缩：照 /context 的算法在本地估，不发请求。
 // 每轮跑完估一次；展开明细时隔了一分钟以上也估一次；点「刷新」马上估
 const CONTEXT_EVERY_MS = 60_000
@@ -1091,6 +480,18 @@ const refreshAgents = async ($: EngineInterface) => {
     await update($, agentLog, current => withStatuses(current, list, at))
   }
 }
+
+const settingsEffort = async ($: EngineInterface) => {
+  const settings = await $.settings.read().catch(() => null)
+  const env = settings?.env
+  const fromEnv =
+    env && typeof env === 'object' ? (env as Record<string, unknown>).CLAUDE_CODE_EFFORT_LEVEL : undefined
+  const value = fromEnv ?? settings?.effortLevel
+
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+// ---------- 额度：Fable 周额度、会提前用完的提醒 ----------
 
 let isFableRefreshing = false
 let fableFetchedAt = 0
@@ -1228,15 +629,7 @@ const loadDaily = async ($: EngineInterface) => {
   await refreshDaily($)
 }
 
-const settingsEffort = async ($: EngineInterface) => {
-  const settings = await $.settings.read().catch(() => null)
-  const env = settings?.env
-  const fromEnv =
-    env && typeof env === 'object' ? (env as Record<string, unknown>).CLAUDE_CODE_EFFORT_LEVEL : undefined
-  const value = fromEnv ?? settings?.effortLevel
-
-  return typeof value === 'string' && value !== '' ? value : null
-}
+// ---------- 工具调用记账：小票、待办、原地打转提醒 ----------
 
 // 工具成功后更新改动行数和待办；工具参数当普通对象逐项检查着读
 const track = async (
@@ -1355,6 +748,8 @@ const record = async (
   }
 }
 
+// ---------- HUD 和明细：排版用的宽度、明细要的数据、点了做什么 ----------
+
 // HUD 第一行前面 ▸ 加一个空格的宽度
 const TOGGLE_WIDTH = 2
 // 输入框上方的编号按钮之间空两格
@@ -1434,6 +829,8 @@ const toggleDetails = async ($: EngineInterface) => {
     void refreshContext($).catch(() => undefined)
   }
 }
+
+// ---------- 模型那边的缓存：能存多久、哪一轮没接上 ----------
 
 // 缓存能存多久：订阅账号（登录 claude.ai）1 小时，API key 和别家的接口 5 分钟。启动时问一次登录方式
 let cacheTtlMs = CACHE_TTL_SHORT_MS
@@ -1574,6 +971,8 @@ const sendChoices = async ($: EngineInterface) => {
   await sendOrFill($, choiceText(list))
 }
 
+// ---------- 本轮计时：每秒走一下 ----------
+
 const tick = async ($: EngineInterface) => {
   const current = await read($, activity)
   if (!current?.isRunning) {
@@ -1583,8 +982,10 @@ const tick = async ($: EngineInterface) => {
   await update($, activity, a => (a?.isRunning ? { ...a, elapsedMs: at - a.startedAt } : a))
 }
 
+// ---------- 挂 hook：每个事件做什么；最后几个是画界面的 ----------
+
 export const register: Register = (on, options) => {
-  config = readConfig(options)
+  Object.assign(config, readConfig(options))
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -2064,19 +1465,7 @@ export const register: Register = (on, options) => {
         ),
       },
     ]
-    // 一个接一个排，一行放不下就换行
-    const width = Math.max(20, e.props.bodyColumns)
-    const rows = cells.reduce<(typeof cells)[]>((done, c) => {
-      const row = done.at(-1)
-      const used = row ? row.reduce((n, x) => n + x.width + CHOICE_GAP, 0) : 0
-      if (row && used + c.width <= width) {
-        row.push(c)
-
-        return done
-      }
-
-      return [...done, [c]]
-    }, [])
+    const rows = packRows(cells, Math.max(20, e.props.bodyColumns), CHOICE_GAP)
 
     return (
       <Box flexDirection="column">

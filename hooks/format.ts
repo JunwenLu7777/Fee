@@ -146,3 +146,6 @@ export const formatWhen = (at: number, now: number, offsetMinutes: number) => {
 
   return day === dayKey(now, offsetMinutes) ? clock : `${weekdayOf(day)} ${clock}`
 }
+
+// 插件环境里的 Date 不一定是本机时区，优先用启动时问到的偏移
+export const offsetOf = (tz: number | null, at: number) => tz ?? -new Date(at).getTimezoneOffset()

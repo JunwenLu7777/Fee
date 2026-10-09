@@ -47,3 +47,4 @@ Claude Code 的 mod：在输入框下方显示自定义 HUD——模型、上下
 - `claude plugin validate .` 校验
 - `claude plugin test .` 跑测试
 - `.claude-plugin/types/` 由引擎加载 mod 时自动生成，已被忽略；加载过一次后可用 `tsc -p .` 做类型检查
+- 代码在 `hooks/`：用到 `$`（读写状态、跑命令、画界面）的都在 `register.tsx`，因为 Claude Code 只许把 `$` 传给同一个文件里的函数；文件开头有目录。不碰 `$` 的分在别的文件：`config.ts`（/config 设置）、`parse.ts`（整理引擎给的数据）、`segments.ts`（HUD 每一段和排版）、`details.tsx`（明细）、`changes.tsx`（改动侧边栏）、`ledger.ts`（小票和统计）、`forecast.ts`（额度预测）、`spend.ts`（每天花费）、`context.ts`（上下文构成）、`choices.ts`（回复里的编号）、`snapshot.ts`（git 快照）、`format.ts`（数字、时长、宽度）
