@@ -34,6 +34,22 @@ export const clip = (s: string, max: number) => {
   return `${out}…`
 }
 
+// 路径放不下时留后面：…/hooks/register.tsx，文件名最要紧
+export const clipStart = (s: string, max: number) => {
+  if (cellWidth(s) <= max) {
+    return s
+  }
+  let out = ''
+  for (const ch of [...s].reverse()) {
+    if (cellWidth(ch + out) > max - 1) {
+      break
+    }
+    out = ch + out
+  }
+
+  return `…${out}`
+}
+
 // 按格子补空格到 width，放不下就截断；中文占两格
 export const padEnd = (s: string, width: number) => {
   const cut = clip(s, width)

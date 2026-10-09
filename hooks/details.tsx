@@ -3,6 +3,7 @@ import type { Elements, RenderElement } from 'claude-code'
 import type {
   HudActivity,
   HudAgent,
+  HudContextParts,
   HudDaily,
   HudDetailsTab,
   HudDetailsView,
@@ -20,7 +21,8 @@ import type {
 import { clip, dayKey, formatElapsed, formatMs, formatSpan, formatTokens, formatUsd, padEnd, padStart, weekdayOf } from './format'
 import { commandLabel, contextGrowth, isLive, sumLines } from './ledger'
 import type { CompactForecast } from './ledger'
-import { isUnpriced, lastDays, spentOn } from './spend'
+import { isUnpriced, lastDays, projectName, spentByProject, spentOn } from './spend'
+import { partName } from './context'
 
 // 点 HUD 最前面的 ▸ 在 HUD 下方展开的明细，和每轮结尾那行下面的小票。
 // 这块在输入框下面，只能点不能打字：排序、翻页、选中、展开都是按钮
@@ -86,6 +88,8 @@ export type DetailsData = {
   now: number
   // ccusage 算的每天花费；还没算过为 null
   daily: HudDaily | null
+  // 会话目录，认出哪个项目是当前的
+  cwd: string
   // 照现在的速度重置前就会用完的额度，一条一句话
   alerts: { text: string; isUrgent: boolean }[]
   // 本地时区相对 UTC 的分钟数
@@ -94,6 +98,8 @@ export type DetailsData = {
   context: number | null
   compactAt: number | null
   compact: CompactForecast | null
+  // 上下文里装了什么；还没估过为 null
+  contextParts: HudContextParts | null
 }
 
 // 点了什么就改一下明细的状态
@@ -105,11 +111,16 @@ export type DetailsActions = {
   refreshDaily: () => void
   // 点失败的命令，把它放进输入框
   fillPrompt: (text: string) => void
+  // 点「刷新」马上重新估上下文里装了什么
+  refreshContext: () => void
+  // 在侧边栏里看改动
+  openChanges: () => void
 }
 
 const TABS: { id: HudDetailsTab; label: string }[] = [
   { id: 'turns', label: '轮次' },
   { id: 'tools', label: '工具耗时' },
+  { id: 'context', label: '上下文' },
   { id: 'agents', label: '子 agent' },
   { id: 'spend', label: '每天花费' },
 ]
@@ -535,7 +546,12 @@ export const drawDetails = (
             ...(rec.agents ? [['子 agent', `${rec.agents} 个`] as const] : []),
           ]),
         )}
-        {rec.files.length > 0 && note(`改了 ${rec.files.length} 个文件`)}
+        {rec.files.length > 0 && (
+          <Box columnGap={1}>
+            {note(`改了 ${rec.files.length} 个文件`)}
+            {link('changes:open', '在侧边栏看 ›', actions.openChanges)}
+          </Box>
+        )}
         {files.map(f => line([{ text: `  ${padEnd(f.path, nameWidth)}` }, ...linesPieces(f.added, f.removed)]))}
         {rec.commands > 0 &&
           line([
@@ -712,6 +728,58 @@ export const drawDetails = (
     </Box>
   )
 
+  // ---------- 上下文里装了什么 ----------
+
+  // 占着窗口的几块从大到小一行一根横条，下面是 MCP 按服务器、记忆文件各占多少；返回画出来的内容和占几行
+  const contextBody = (width: number, rows: number): { body: RenderElement; height: number } => {
+    const c = data.contextParts
+    if (!c) {
+      return { body: note('还没估过上下文里装了什么，跑完一轮就有。'), height: 1 }
+    }
+    const used = c.parts.reduce((n, p) => n + p.tokens, 0)
+    const max = Math.max(0, ...c.parts.map(p => p.tokens))
+    const nameWidth = 12
+    const barWidth = Math.max(4, Math.min(20, width - nameWidth - 9))
+    const extras = (c.mcp.length ? 1 : 0) + (c.memory.length ? 1 : 0) + (c.deferred ? 1 : 0)
+    const fits = Math.max(3, rows - 2 - extras)
+    // 放不下时最后一行写还有几块，不悄悄藏起来
+    const shown = c.parts.length > fits ? c.parts.slice(0, fits - 1) : c.parts
+    const hidden = c.parts.slice(shown.length)
+    // 只列前几个，后面的写个数
+    const top = (list: readonly { name: string; tokens: number }[], room: number) => {
+      const named = list.slice(0, 3).map(p => `${p.name} ${formatTokens(p.tokens)}`)
+      const rest = list.length - named.length
+
+      return clip([...named, ...(rest > 0 ? [`另外 ${rest} 个`] : [])].join(' · '), room)
+    }
+    const ago = data.now - c.at < 60_000 ? '刚刚估的' : `${formatSpan(data.now - c.at)}前估的`
+
+    return {
+      body: (
+        <Box flexDirection="column">
+          {line(facts([['占着窗口', formatTokens(used)], ...(data.compactAt ? [['到', `${formatTokens(data.compactAt)} 自动压缩`] as const] : [])]))}
+          {shown.map(p =>
+            line([
+              { text: `${padEnd(partName(p.name), nameWidth)} `, dim: true },
+              { text: padEnd(barOf(p.tokens, max, barWidth), barWidth), color: 'blue' },
+              { text: ` ${padStart(formatTokens(p.tokens), 6)}` },
+            ]),
+          )}
+          {hidden.length > 0 &&
+            note(`…还有 ${hidden.length} 块，一共 ${formatTokens(hidden.reduce((n, p) => n + p.tokens, 0))}`)}
+          {c.mcp.length > 0 && line([{ text: 'MCP：', dim: true }, { text: top(c.mcp, width - 5) }])}
+          {c.memory.length > 0 && line([{ text: '记忆文件：', dim: true }, { text: top(c.memory, width - 10) }])}
+          {c.deferred > 0 && note(`按需才加载的工具说明 ${formatTokens(c.deferred)}，平时不占窗口`)}
+          <Box columnGap={1}>
+            {note(`估算 · ${ago}`)}
+            {link('context:refresh', '刷新', actions.refreshContext)}
+          </Box>
+        </Box>
+      ),
+      height: 2 + shown.length + (hidden.length ? 1 : 0) + extras,
+    }
+  }
+
   // ---------- 每天花费 ----------
 
   // 照现在的速度重置前就会用完的额度，写在每天花费最上面；返回画出来的内容和占几行
@@ -740,11 +808,52 @@ export const drawDetails = (
     }
     const today = dayKey(data.now, data.offset)
     const unpriced = isUnpriced(d.days)
-    const count = Math.max(3, Math.min(DAYS_SHOWN, rows - alerts.length - 2 - (unpriced ? 1 : 0)))
+    const count = Math.max(3, Math.min(DAYS_SHOWN, rows - alerts.length - 3 - (unpriced ? 1 : 0)))
     const dates = lastDays(today, count)
     const costOf = new Map(d.days.map(x => [x.date, x.costUsd]))
     const max = Math.max(0, ...dates.map(k => costOf.get(k) ?? 0))
     const barWidth = Math.max(4, Math.min(24, width - 20))
+    const byProject = view.spendBy === 'project'
+    // 按天看、按项目看，点着切换
+    const switcher = (
+      <Box columnGap={2}>
+        {(['day', 'project'] as const).map(by => (
+          <Button
+            key={`spend:${by}`}
+            plain
+            {...(view.spendBy === by ? {} : { dimColor: true })}
+            onPress={() => patch({ spendBy: by })}
+          >
+            {`${view.spendBy === by ? '▸' : ' '} ${by === 'day' ? '按天' : '近 7 天按项目'}`}
+          </Button>
+        ))}
+      </Box>
+    )
+    // 近 7 天每个项目花了多少，多的在前；当前项目标出来；放不下的合成一行
+    const projectRows = () => {
+      if (d.projects.length === 0) {
+        return [note('还没有按项目的数，下次刷新就有。')]
+      }
+      const list = spentByProject(d.projects, lastDays(today, 7))
+      const top = list.slice(0, count)
+      const topMax = Math.max(0, ...top.map(p => p.costUsd))
+      const nameWidth = Math.max(8, Math.min(24, width - 4 - 9 - 10))
+      const rest = list.slice(top.length)
+      const restCost = rest.reduce((n, p) => n + p.costUsd, 0)
+
+      return [
+        ...top.map(p => {
+          const { name, isCurrent } = projectName(p.project, data.cwd)
+
+          return line([
+            { text: `${padEnd(isCurrent ? `${name}（当前）` : name, nameWidth)} `, ...(isCurrent ? {} : { dim: true }) },
+            { text: padEnd(barOf(p.costUsd, topMax, 10), 10), color: 'yellow' },
+            { text: ` ${padStart(formatUsd(p.costUsd), 8)}` },
+          ])
+        }),
+        ...(rest.length ? [note(`…还有 ${rest.length} 个项目 ${formatUsd(restCost)}`)] : []),
+      ]
+    }
     const ago = d.fetchedAt == null ? '' : data.now - d.fetchedAt < 60_000 ? '刚刚算的' : `${formatSpan(data.now - d.fetchedAt)}前算的`
 
     return {
@@ -758,16 +867,19 @@ export const drawDetails = (
               ['近 30 天', formatUsd(spentOn(d.days, lastDays(today, 30)))],
             ]),
           )}
-          {dates.map(k => {
-            const cost = costOf.get(k) ?? 0
-            const isToday = k === today
+          {switcher}
+          {byProject
+            ? projectRows()
+            : dates.map(k => {
+                const cost = costOf.get(k) ?? 0
+                const isToday = k === today
 
-            return line([
-              { text: `${k.slice(5).replace('-', '/')} ${weekdayOf(k)} `, ...(isToday ? {} : { dim: true }) },
-              { text: padEnd(barOf(cost, max, barWidth), barWidth), color: 'yellow' },
-              { text: ` ${padStart(cost ? formatUsd(cost) : '-', 8)}`, ...(cost ? {} : { dim: true }) },
-            ])
-          })}
+                return line([
+                  { text: `${k.slice(5).replace('-', '/')} ${weekdayOf(k)} `, ...(isToday ? {} : { dim: true }) },
+                  { text: padEnd(barOf(cost, max, barWidth), barWidth), color: 'yellow' },
+                  { text: ` ${padStart(cost ? formatUsd(cost) : '-', 8)}`, ...(cost ? {} : { dim: true }) },
+                ])
+              })}
           {unpriced && note('有的天 ccusage 不认识模型的价格，记成了 $0，升级 ccusage 试试。')}
           <Box columnGap={1}>
             {note(['本机所有会话', 'ccusage', ago].filter(Boolean).join(' · '))}
@@ -776,7 +888,7 @@ export const drawDetails = (
           {d.error && !d.isRunning && note(`上次刷新没成：${d.error === 'missing' ? '没找到 ccusage' : d.error}`)}
         </Box>
       ),
-      height: alerts.length + 2 + count + (unpriced ? 1 : 0) + (d.error ? 1 : 0),
+      height: alerts.length + 3 + count + (unpriced ? 1 : 0) + (d.error ? 1 : 0),
     }
   }
 
@@ -794,16 +906,20 @@ export const drawDetails = (
     </Box>
   )
 
-  // 宽的时候轮次、工具耗时并排，最右边一列上面是每天花费、下面是子 agent，一眼看完
+  // 宽的时候三列：轮次；工具耗时下面是上下文；最右边一列上面是每天花费、下面是子 agent，一眼看完
   if (size.columns >= SIDE_BY_SIDE_MIN) {
     const rows = size.rows - 3
     const sideWidth = size.columns - TURNS_WIDTH - TOOLS_WIDTH - CARD_GAP * 2 - CARD_CHROME
     const spend = spendBody(sideWidth, rows - 4)
+    const inside = contextBody(TOOLS_WIDTH - CARD_CHROME, Math.max(5, Math.floor(rows / 2)))
 
     return (
       <Box columnGap={CARD_GAP}>
         {card('轮次', TURNS_WIDTH, turnsBody(TURNS_WIDTH - CARD_CHROME, rows))}
-        {card('工具耗时', TOOLS_WIDTH, toolsBody(TOOLS_WIDTH - CARD_CHROME, rows))}
+        <Box flexDirection="column" width={TOOLS_WIDTH}>
+          {card('工具耗时', 'fit', toolsBody(TOOLS_WIDTH - CARD_CHROME, Math.max(5, rows - inside.height - 3)))}
+          {card('上下文', 'grow', inside.body)}
+        </Box>
         <Box flexDirection="column" flexGrow={1}>
           {card('每天花费', 'fit', spend.body)}
           {card('子 agent', 'grow', agentsBody(sideWidth, Math.max(3, rows - spend.height - 3)))}
@@ -835,7 +951,9 @@ export const drawDetails = (
       ? toolsBody(width, rows)
       : tab.id === 'agents'
         ? agentsBody(width, rows)
-        : tab.id === 'spend'
+        : tab.id === 'context'
+          ? contextBody(width, rows).body
+          : tab.id === 'spend'
           ? spendBody(width, rows).body
           : turnsBody(width, rows)
 

@@ -148,9 +148,18 @@ export type HudDay = {
   tokens: number
 }
 
+// ccusage 算的某个项目某一天花了多少；项目是 ~/.claude/projects 下的文件夹名（会话目录把 / 换成 -）
+export type HudProjectDay = {
+  project: string
+  date: string
+  costUsd: number
+}
+
 // 每天花费：ccusage 读本机所有会话的记录算的，最近 30 天
 export type HudDaily = {
   days: HudDay[]
+  // 按项目分的；旧版本存下的没有
+  projects: HudProjectDay[]
   // 上次算好的时间；还没算好过为 null
   fetchedAt: number | null
   // 上次没算成的原因；missing 是没装 ccusage
@@ -158,7 +167,42 @@ export type HudDaily = {
   isRunning: boolean
 }
 
-export type HudDetailsTab = 'turns' | 'tools' | 'agents' | 'spend'
+// 上下文里的一块：系统提示、工具说明、对话……，或者一个 MCP 服务器、一个记忆文件
+export type HudContextPart = {
+  name: string
+  tokens: number
+}
+
+// 上下文里装了什么：Claude Code 照 /context 的算法在本地估的，不发请求；每轮跑完估一次
+export type HudContextParts = {
+  // 什么时候估的
+  at: number
+  // 占着窗口的几块，从大到小
+  parts: HudContextPart[]
+  // 按服务器加起来的 MCP 工具说明，只算已经放进窗口的
+  mcp: HudContextPart[]
+  // 记忆文件（CLAUDE.md 之类）
+  memory: HudContextPart[]
+  // 按需才加载、不占窗口的工具说明一共多少
+  deferred: number
+}
+
+// 改动侧边栏里点出来的状态：看哪个文件、它的改动翻到第几页
+export type HudChangesView = {
+  path: string | null
+  page: number
+}
+
+// 侧边栏里点开的那个文件改了什么：会话开始到最近一张快照的 git diff，只留前几百行
+export type HudFileDiff = {
+  path: string
+  // 比的是哪张快照，工作区又变了就重新读
+  tree: string
+  lines: string[]
+  isCut: boolean
+}
+
+export type HudDetailsTab = 'turns' | 'tools' | 'context' | 'agents' | 'spend'
 
 // 轮次按什么排：recent 最近的在前，其余按那一列从大到小
 export type HudTurnSort = 'recent' | 'duration' | 'cost' | 'input' | 'output' | 'context'
@@ -180,6 +224,8 @@ export type HudDetailsView = {
   toolSort: HudToolSort
   // 展开的子 agent
   agent: string | null
+  // 每天花费按天看还是按项目看
+  spendBy: 'day' | 'project'
 }
 
 declare module 'claude-code' {
@@ -221,6 +267,14 @@ declare module 'claude-code' {
       daily: HudDaily | null
       // 上下文到多少 token 时自动压缩；自动压缩关了或者还不知道为 null
       compactAt: number | null
+      contextParts: HudContextParts | null
+      // 会话开始以来改过的文件（git 快照对比），按路径排；最近一张快照；侧边栏里点开的文件和它的改动
+      sessionFiles: HudFileEdit[]
+      lastTree: string | null
+      changesView: HudChangesView
+      fileDiff: HudFileDiff | null
+      // 改动侧边栏开着、而且摆出来了；没摆出来时 HUD 右边才放「◂ 改动」
+      isChangesUp: boolean
     }
   }
 }

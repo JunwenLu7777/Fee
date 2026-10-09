@@ -17,6 +17,8 @@ import type { LimitWindow } from './forecast'
 import { SNAPSHOT_SCRIPT, parseNumstat, parseSnapshot } from './snapshot'
 import type { Snapshot } from './snapshot'
 import { parseDaily, parseStored } from './spend'
+import { partsOf } from './context'
+import { drawChanges } from './changes'
 import {
   EDIT_TOOLS,
   LOOP_EDITS,
@@ -81,8 +83,18 @@ const warnedLimits = atom({ plugin: 'hud', key: 'warnedLimits' } as const, {})
 const baseTree = atom({ plugin: 'hud', key: 'baseTree' } as const, null)
 const daily = atom({ plugin: 'hud', key: 'daily' } as const, null)
 const compactAt = atom({ plugin: 'hud', key: 'compactAt' } as const, null)
+const contextParts = atom({ plugin: 'hud', key: 'contextParts' } as const, null)
+const sessionFiles = atom({ plugin: 'hud', key: 'sessionFiles' } as const, [])
+const lastTree = atom({ plugin: 'hud', key: 'lastTree' } as const, null)
+const changesView = atom({ plugin: 'hud', key: 'changesView' } as const, { path: null, page: 0 })
+const fileDiff = atom({ plugin: 'hud', key: 'fileDiff' } as const, null)
+// 改动侧边栏摆出来了没有：没摆出来时 HUD 右边才放「◂ 改动」；以引擎记的为准，隔几秒对一次
+const isChangesUp = atom({ plugin: 'hud', key: 'isChangesUp' } as const, false)
 
 const HIDDEN_KEY = 'isHidden'
+// 改动侧边栏：你亲手关掉过就记下，下次启动不再自己打开
+const CHANGES_PANE = 'hud-changes'
+const CHANGES_KEY = 'changesPane'
 // 上一次 ccusage 算出来的每天花费，下次启动先拿它画
 const DAILY_KEY = 'daily'
 // 引擎给插件的 rateLimits 只有 5h / 7d，Fable 的周额度得自己去 /usage 用的接口拿
@@ -788,6 +800,13 @@ const measureChanges = async ($: EngineInterface) => {
     const files = await diffTrees($, base, snap)
     if (files) {
       await update($, diff, () => sumLines(files))
+      await update($, sessionFiles, () => [...files].sort((x, y) => x.path.localeCompare(y.path)))
+      const previous = await read($, lastTree)
+      await update($, lastTree, () => snap.tree)
+      // 工作区变了，侧边栏里点开的那个文件重新读
+      if (previous !== snap.tree && (await read($, changesView)).path) {
+        await loadFileDiff($)
+      }
     }
   }
   if (a && turnBase) {
@@ -819,21 +838,104 @@ const refreshChanges = ($: EngineInterface) => {
   return changesRun
 }
 
-// 自动压缩在上下文到多少 token 时触发：按 /context 的算法在本地估，不发请求
-const refreshCompactAt = async ($: EngineInterface) => {
-  const usage = await $.session.usage({ breakdown: 'summary' }).catch(() => null)
-  const b = usage?.context.breakdown
-  const threshold = b?.isAutoCompactEnabled && b.autoCompactThreshold ? b.autoCompactThreshold : null
-  await update($, compactAt, () => threshold)
+// 侧边栏里点开的文件：会话开始到最近一张快照改了什么。只留改动本身（@@ 起），太长的截掉
+const FILE_DIFF_MAX = 400
+
+const patchLines = (out: string) => {
+  const lines = out.split('\n')
+  const start = lines.findIndex(l => l.startsWith('@@') || l.startsWith('Binary files'))
+
+  return start < 0 ? [] : lines.slice(start).filter((l, i, all) => !(i === all.length - 1 && l === ''))
 }
 
-// 换了模型，上下文窗口可能跟着变，自动压缩的点重新问一次
+const loadFileDiff = async ($: EngineInterface) => {
+  const [view, base, tree] = await Promise.all([read($, changesView), read($, baseTree), read($, lastTree)])
+  const path = view.path
+  if (!path || !base || !tree) {
+    await update($, fileDiff, () => null)
+
+    return
+  }
+  const ran = await serially(() =>
+    $.process
+      .run(['git', 'diff', '--no-color', '--no-ext-diff', '-U3', base, tree, '--', path], { timeoutMs: SNAPSHOT_TIMEOUT_MS })
+      .catch(() => null),
+  )
+  const lines = ran?.exitCode === 0 ? patchLines(ran.stdout) : []
+  const kept = lines.slice(0, FILE_DIFF_MAX)
+  const before = await read($, fileDiff)
+  await update($, fileDiff, () => ({ path, tree, lines: kept, isCut: lines.length > FILE_DIFF_MAX }))
+  // 这一轮又改了它、改动变长变短了，翻到的页就不对了，回到第一页
+  if (before?.path === path && before.lines.length !== kept.length) {
+    await update($, changesView, v => (v.path === path ? { ...v, page: 0 } : v))
+  }
+}
+
+// 点一个文件看它的改动，再点一下收起
+const pickFile = async ($: EngineInterface, path: string) => {
+  const view = await update($, changesView, v => (v.path === path ? { path: null, page: 0 } : { path, page: 0 }))
+  if (view.path) {
+    await loadFileDiff($)
+  }
+}
+
+// 侧边栏开着、而且摆出来了（没摆出来的是终端太窄、在等着）。终端拉宽后才摆出来的、热重载前就开着的都靠这个对上
+const syncChanges = async ($: EngineInterface) => {
+  const panes = await $.ui.panes().catch(() => null)
+  if (!panes) {
+    return
+  }
+  const isUp = panes.some(p => p.id === CHANGES_PANE && p.isPlaced)
+  if (isUp !== (await read($, isChangesUp))) {
+    await update($, isChangesUp, () => isUp)
+  }
+}
+
+// 自己打开（启动时）：终端够宽才摆出来；你亲手关过就不再自己开。热重载时侧边栏还开着，不用再开
+const autoOpenChanges = async ($: EngineInterface) => {
+  const isOpen = (await $.ui.panes().catch(() => [])).some(p => p.id === CHANGES_PANE)
+  if (!isOpen && (await read($, baseTree)) && (await $.store.get(CHANGES_KEY)) !== 'closed') {
+    await $.ui.open({ id: CHANGES_PANE, title: '改动' })
+  }
+  await syncChanges($)
+}
+
+// 从明细或者 HUD 右边的「◂ 改动」点开：多窄都摆出来，以后启动也照常自己开
+const openChanges = async ($: EngineInterface) => {
+  await $.store.set(CHANGES_KEY, 'open')
+  const opened = await $.ui.open({ id: CHANGES_PANE, title: '改动' })
+  await update($, isChangesUp, () => opened.isPlaced)
+}
+
+// 上下文里装了什么、到多少自动压缩：照 /context 的算法在本地估，不发请求。
+// 每轮跑完估一次；展开明细时隔了一分钟以上也估一次；点「刷新」马上估
+const CONTEXT_EVERY_MS = 60_000
+let isContextRefreshing = false
+
+const refreshContext = async ($: EngineInterface, force = false) => {
+  const [at, current] = await Promise.all([$.clock.now(), read($, contextParts)])
+  if (isContextRefreshing || (!force && current && at - current.at < CONTEXT_EVERY_MS)) {
+    return
+  }
+  isContextRefreshing = true
+  try {
+    const b = (await $.session.usage({ breakdown: 'summary' }).catch(() => null))?.context.breakdown
+    if (b) {
+      await update($, compactAt, () => (b.isAutoCompactEnabled && b.autoCompactThreshold ? b.autoCompactThreshold : null))
+      await update($, contextParts, () => partsOf(b, at, cwdPath))
+    }
+  } finally {
+    isContextRefreshing = false
+  }
+}
+
+// 换了模型，上下文窗口可能跟着变，自动压缩的点重新估一次
 const refreshModel = async ($: EngineInterface) => {
   const id = await $.session.model()
   const previous = await read($, modelId)
   await update($, modelId, () => id)
   if (id !== previous) {
-    await refreshCompactAt($)
+    await refreshContext($, true)
   }
 }
 
@@ -943,7 +1045,7 @@ const DAY_MS = 86_400_000
 let isDailyRunning = false
 let dailyTriedAt = 0
 
-const emptyDaily = (): HudDaily => ({ days: [], fetchedAt: null, error: null, isRunning: false })
+const emptyDaily = (): HudDaily => ({ days: [], projects: [], fetchedAt: null, error: null, isRunning: false })
 
 // 没装 ccusage 时 nice 报「No such file or directory」、退出码 127
 const dailyError = (ran: { exitCode: number; stderr: string } | null) => {
@@ -972,7 +1074,7 @@ const refreshDaily = async ($: EngineInterface, force = false) => {
     // 同时开着几个会话时，别的会话刚算过就直接拿它存下的
     const stored = parseStored(await $.store.get(DAILY_KEY).catch(() => null))
     if (stored && at - stored.fetchedAt < DAILY_EVERY_MS && stored.fetchedAt > (current?.fetchedAt ?? 0)) {
-      await update($, daily, d => ({ ...(d ?? emptyDaily()), days: stored.days, fetchedAt: stored.fetchedAt, error: null }))
+      await update($, daily, d => ({ ...(d ?? emptyDaily()), ...stored, error: null }))
 
       return
     }
@@ -982,14 +1084,16 @@ const refreshDaily = async ($: EngineInterface, force = false) => {
   try {
     await update($, daily, d => ({ ...(d ?? emptyDaily()), isRunning: true }))
     const since = dayKey(at - (DAILY_DAYS - 1) * DAY_MS, offsetOf(tz, at)).replace(/-/g, '')
-    // ccusage 很吃 CPU，降低优先级跑，别和手头的活抢
+    // ccusage 很吃 CPU，降低优先级跑，别和手头的活抢；带上 --instances 一次拿到按项目分的
     const ran = await $.process
-      .run(['nice', '-n', '10', 'ccusage', 'daily', '--json', '--since', since], { timeoutMs: DAILY_TIMEOUT_MS })
+      .run(['nice', '-n', '10', 'ccusage', 'daily', '--json', '--instances', '--since', since], {
+        timeoutMs: DAILY_TIMEOUT_MS,
+      })
       .catch(() => null)
-    const days = ran?.exitCode === 0 ? parseDaily(ran.stdout) : null
-    if (days) {
-      await update($, daily, () => ({ days, fetchedAt: at, error: null, isRunning: false }))
-      await $.store.set(DAILY_KEY, { days, fetchedAt: at })
+    const found = ran?.exitCode === 0 ? parseDaily(ran.stdout) : null
+    if (found) {
+      await update($, daily, () => ({ ...found, fetchedAt: at, error: null, isRunning: false }))
+      await $.store.set(DAILY_KEY, { ...found, fetchedAt: at })
     } else {
       const error = ran?.exitCode === 0 ? 'ccusage 的输出看不懂' : dailyError(ran)
       await update($, daily, d => ({ ...(d ?? emptyDaily()), error, isRunning: false }))
@@ -1141,10 +1245,13 @@ const record = async (
 
 // HUD 第一行前面 ▸ 加一个空格的宽度
 const TOGGLE_WIDTH = 2
+// 改动侧边栏收着时，HUD 第一行最右边放个「◂ 改动」，点了拉出来；摆出来以后用侧边栏右上角自带的 × 关。
+// 关掉后屏幕右上角没有插件能画的地方，只能放这里
+const SHOW_CHANGES = '◂ 改动'
 
 // 展开时 HUD 下方的明细；最多占终端一半高、20 行
 const detailsOf = async ($: EngineInterface, columns: number, viewportRows: number) => {
-  const [view, log, live, tools, calls, agentsSeen, s, t, at, spend, fb, tz, threshold] = await Promise.all([
+  const [view, log, live, tools, calls, agentsSeen, s, t, at, spend, fb, tz, threshold, inside] = await Promise.all([
     read($, detailsView),
     read($, turnLog),
     read($, activity),
@@ -1158,6 +1265,7 @@ const detailsOf = async ($: EngineInterface, columns: number, viewportRows: numb
     read($, fable),
     read($, tzOffset),
     read($, compactAt),
+    read($, contextParts),
   ])
   const isRunning = live?.isRunning === true
   const offset = offsetOf(tz, at ?? 0)
@@ -1174,6 +1282,7 @@ const detailsOf = async ($: EngineInterface, columns: number, viewportRows: numb
     // 这一轮在跑时每秒都有新的耗时，比按分钟走的 now 新
     now: isRunning ? live.startedAt + live.elapsedMs : (at ?? 0),
     daily: spend,
+    cwd: cwdPath,
     alerts: limitWindows(s, fb, at ?? 0, forecastShare()).flatMap(w =>
       w.forecast ? [{ text: alertText(w, at ?? 0, offset), isUrgent: w.forecast.isUrgent }] : [],
     ),
@@ -1181,6 +1290,7 @@ const detailsOf = async ($: EngineInterface, columns: number, viewportRows: numb
     context,
     compactAt: threshold,
     compact: compactForecast(log, context, threshold),
+    contextParts: inside,
   }
 
   return { data, size: { columns, rows: Math.max(10, Math.min(20, Math.floor(viewportRows / 2))) } }
@@ -1203,6 +1313,7 @@ const toggleDetails = async ($: EngineInterface) => {
   const open = await update($, isExpanded, v => !v)
   if (open) {
     void refreshDaily($).catch(() => undefined)
+    void refreshContext($).catch(() => undefined)
   }
 }
 
@@ -1232,6 +1343,7 @@ export const register: Register = (on, options) => {
     $.clock.every(1000, () => void tick($))
     $.clock.every(3000, () => void refreshAgents($))
     $.clock.every(5000, () => void refreshNow($))
+    $.clock.every(5000, () => void syncChanges($))
     $.clock.every(FABLE_EVERY_MS, () => void refreshFable($))
 
     const [usage, cwd, configured] = await Promise.all([
@@ -1252,10 +1364,12 @@ export const register: Register = (on, options) => {
     await refreshOffset($)
     await checkLimits($)
     void refreshFable($)
-    void initBaseline($).catch(() => undefined)
+    void initBaseline($)
+      .then(() => autoOpenChanges($))
+      .catch(() => undefined)
     void loadDaily($).catch(() => undefined)
-    // 热重载时模型没变也问一次，旧版本没记过自动压缩的点
-    void refreshCompactAt($).catch(() => undefined)
+    // 热重载时模型没变也估一次，旧版本没记过自动压缩的点
+    void refreshContext($, true).catch(() => undefined)
 
     return started
   })
@@ -1363,6 +1477,7 @@ export const register: Register = (on, options) => {
     await refreshAgents($)
     void refreshFable($)
     void refreshDaily($).catch(() => undefined)
+    void refreshContext($, true).catch(() => undefined)
 
     return done
   })
@@ -1444,6 +1559,10 @@ export const register: Register = (on, options) => {
     await update($, toolCalls, () => [])
     await update($, detailsView, () => defaultView())
     await update($, baseTree, () => null)
+    await update($, sessionFiles, () => [])
+    await update($, lastTree, () => null)
+    await update($, changesView, () => ({ path: null, page: 0 }))
+    await update($, fileDiff, () => null)
     await refreshTurns($)
     void initBaseline($).catch(() => undefined)
 
@@ -1461,6 +1580,49 @@ export const register: Register = (on, options) => {
     await $.store.set(HIDDEN_KEY, hide)
 
     return { text: hide ? 'HUD 已关闭，输入 /hud 重新打开' : 'HUD 已打开' }
+  })
+
+  // 改动侧边栏：会话开始以来改过的文件，● 是这一轮改过的；点一个看它改了什么
+  on('ui.render', { component: 'Pane', requestId: CHANGES_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const [base, files, view, shownDiff, a, log] = await Promise.all([
+      read($, baseTree),
+      read($, sessionFiles),
+      read($, changesView),
+      read($, fileDiff),
+      read($, activity),
+      read($, turnLog),
+    ])
+    const turn = a?.isRunning ? a.receipt : log.at(-1)?.receipt
+
+    return drawChanges(
+      { Box, Text, Button },
+      {
+        isTracked: base != null,
+        files,
+        turnFiles: new Set((turn?.files ?? []).map(f => f.path)),
+        view,
+        diff: shownDiff,
+      },
+      { columns: e.props.bodyColumns, rows: e.props.scroll.bodyRows },
+      {
+        pick: path => void pickFile($, path),
+        page: page => void update($, changesView, v => ({ ...v, page })),
+      },
+    )
+  })
+
+  // 侧边栏关了，HUD 右边的开关跟着变；你亲手关掉的还要记下，以后启动不再自己打开（从明细或开关点开会改回来）
+  on('ui.close', async ($, e, next) => {
+    const done = await next(e)
+    if (e.id === CHANGES_PANE) {
+      await update($, isChangesUp, () => false)
+      if (e.origin?.kind === 'person') {
+        await $.store.set(CHANGES_KEY, 'closed')
+      }
+    }
+
+    return done
   })
 
   // 每轮结尾那行（✻ … for 1m 14s）下面另起一行写这一轮的小票：花了多少、改了哪些文件、几条命令失败。
@@ -1562,26 +1724,29 @@ export const register: Register = (on, options) => {
     }
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded, log, threshold] = await Promise.all([
-      read($, stats),
-      read($, modelId),
-      read($, effort),
-      read($, git),
-      read($, dir),
-      read($, activity),
-      read($, now),
-      read($, tokens),
-      read($, diff),
-      read($, todos),
-      read($, agents),
-      read($, fable),
-      read($, turns),
-      read($, version),
-      read($, tzOffset),
-      read($, isExpanded),
-      read($, turnLog),
-      read($, compactAt),
-    ])
+    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded, log, threshold, base, isUp] =
+      await Promise.all([
+        read($, stats),
+        read($, modelId),
+        read($, effort),
+        read($, git),
+        read($, dir),
+        read($, activity),
+        read($, now),
+        read($, tokens),
+        read($, diff),
+        read($, todos),
+        read($, agents),
+        read($, fable),
+        read($, turns),
+        read($, version),
+        read($, tzOffset),
+        read($, isExpanded),
+        read($, turnLog),
+        read($, compactAt),
+        read($, baseTree),
+        read($, isChangesUp),
+      ])
     const view: View = {
       stats: s,
       modelId: id,
@@ -1603,9 +1768,14 @@ export const register: Register = (on, options) => {
     const viewportColumns = e.viewport?.columns ?? 120
     // 每行前面留两格给 ▸
     const columns = Math.max(20, viewportColumns - 4 - TOGGLE_WIDTH)
-    const rows = layout(viewportColumns)
-      .map(row => fit(row.segments(view), row.degrade, columns))
-      .filter(r => r.length > 0)
+    // 侧边栏收着、又是 git 仓库（不是仓库的看不了改动）才放「◂ 改动」；第一行右边给它留出位置
+    const side = base && !isUp ? SHOW_CHANGES : null
+    const sideWidth = side ? cellWidth(side) + 1 : 0
+    const rows = layout(viewportColumns).reduce<Variant[][]>((drawn, row) => {
+      const groups = fit(row.segments(view), row.degrade, drawn.length === 0 ? columns - sideWidth : columns)
+
+      return groups.length > 0 ? [...drawn, groups] : drawn
+    }, [])
 
     const draw = (groups: Variant[]) =>
       groups.flatMap((pieces, i) => [
@@ -1628,18 +1798,27 @@ export const register: Register = (on, options) => {
         </Button>
       </Box>
     )
+    const sideToggle = side && (
+      <Box flexGrow={1} flexShrink={0} justifyContent="flex-end" marginLeft={1}>
+        <Button key="hud:changes" plain dimColor onPress={() => void openChanges($).catch(() => undefined)}>
+          {side}
+        </Button>
+      </Box>
+    )
     const shown = expanded ? await detailsOf($, columns, e.viewport?.rows ?? 40) : null
     const details = shown
       ? drawDetails({ Box, Text, Button }, shown.data, shown.size, {
           setView: change => void update($, detailsView, change),
           refreshDaily: () => void refreshDaily($, true).catch(() => undefined),
           fillPrompt: command => void fillPrompt($, command),
+          refreshContext: () => void refreshContext($, true).catch(() => undefined),
+          openChanges: () => void openChanges($).catch(() => undefined),
         })
       : null
 
     // 引擎自己的那行不能放在带 width 的 Box 里，否则整棵树会被拒绝，外层只靠 column 拉伸。
     // 每行从左往右连着画，不往右顶：宽屏上贴右边的内容离左边太远，看着像不属于 HUD。
-    // 第一行前面是 ▸，其他行空出同样宽，和第一行对齐
+    // 第一行前面是 ▸，其他行空出同样宽，和第一行对齐；只有「◂ 改动」贴最右边
     return (
       <Box flexDirection="column">
         {line}
@@ -1647,6 +1826,7 @@ export const register: Register = (on, options) => {
           <Box width="100%" {...(i ? { paddingLeft: TOGGLE_WIDTH } : {})}>
             {i === 0 && toggle}
             <Text wrap="truncate-end">{draw(groups)}</Text>
+            {i === 0 && sideToggle}
           </Box>
         ))}
         {details && (

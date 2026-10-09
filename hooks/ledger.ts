@@ -135,6 +135,7 @@ export const defaultView = (): HudDetailsView => ({
   tool: null,
   toolSort: 'total',
   agent: null,
+  spendBy: 'day',
 })
 
 // 一次调用在明细里怎么称呼：命令看第一行，读写文件看路径

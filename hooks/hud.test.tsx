@@ -67,9 +67,44 @@ type World = {
   ccusageRuns?: string[][]
   // 自动压缩在上下文到多少 token 时触发；不给就当关着
   compactAt?: number
+  // 记下要了几次上下文明细
+  asks?: { breakdown: number }
+  // 记下打开过的侧边栏；panes 是开着的（一开始给的是热重载前就开着的），打开时跟着变；
+  // waiting 是开着但终端太窄还没摆出来的，你点了才摆出来
+  opened?: string[]
+  panes?: string[]
+  waiting?: string[]
 }
 
-type Repo = { tree: string; numstat: Record<string, string>; snapshots: number }
+// patches：点开一个文件时 git diff 答的内容，按路径查
+type Repo = { tree: string; numstat: Record<string, string>; snapshots: number; patches?: Record<string, string> }
+
+// Claude Code 估的上下文明细：对话 30k、内置工具 24k、MCP 9k、系统提示 3k、记忆文件 2k 占着窗口；
+// 另有 45k 按需加载的工具说明不占窗口
+const breakdownOf = (compactAt: number | undefined) =>
+  ({
+    categories: [
+      { name: 'System prompt', tokens: 3_000, kind: 'used', color: 'promptBorder', isDeferred: false },
+      { name: 'System tools', tokens: 24_000, kind: 'used', color: 'inactive', isDeferred: false },
+      { name: 'MCP tools', tokens: 9_000, kind: 'used', color: 'cyan_FOR_SUBAGENTS_ONLY', isDeferred: false },
+      { name: 'Memory files', tokens: 2_000, kind: 'used', color: 'claude', isDeferred: false },
+      { name: 'Messages', tokens: 30_000, kind: 'used', color: 'purple_FOR_SUBAGENTS_ONLY', isDeferred: false },
+      { name: 'Free space', tokens: 100_000, kind: 'free', color: 'promptBorder', isDeferred: false },
+      { name: 'Autocompact buffer', tokens: 32_000, kind: 'buffer', color: 'inactive', isDeferred: false },
+      { name: 'MCP tools (deferred)', tokens: 45_000, kind: 'deferred', color: 'inactive', isDeferred: true },
+    ],
+    mcpTools: [
+      { name: 'mcp__figma__get_design', serverName: 'figma', tokens: 6_000, isLoaded: true },
+      { name: 'mcp__slack__send', serverName: 'slack', tokens: 3_000, isLoaded: true },
+      { name: 'mcp__jira__search', serverName: 'jira', tokens: 45_000, isLoaded: false },
+    ],
+    memoryFiles: [
+      { path: `${CWD}/CLAUDE.md`, type: 'Project', tokens: 1_500 },
+      { path: '/Users/me/.claude/CLAUDE.md', type: 'User', tokens: 500 },
+    ],
+    ...(compactAt ? { autoCompactThreshold: compactAt } : {}),
+    isAutoCompactEnabled: compactAt != null,
+  }) as never
 
 // 当前测试的时钟拨 0 毫秒：等后台还没跑完的活（比如启动时拉 Fable 额度）都跑完
 let settle = async () => {}
@@ -91,6 +126,10 @@ const world = (
     ccusage,
     ccusageRuns = [],
     compactAt,
+    asks = { breakdown: 0 },
+    opened = [],
+    panes = [],
+    waiting = [],
   }: World = {},
 ) => {
   const clock = mock.clock(on, { now: NOW })
@@ -119,23 +158,29 @@ const world = (
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.cwd', () => ({ value: CWD }))
   on('settings.read', () => ({ value: { effortLevel: 'xhigh' } }))
-  on('session.usage', ($, e) => ({
-    value: {
-      startedAt: session.startedAt,
-      context: {
-        tokens: 68_000,
-        window: 200_000,
-        percent: 34,
-        // 要了分类明细才带上自动压缩的点；测试只用得到这两项
-        ...(e.breakdown && compactAt ? { breakdown: { autoCompactThreshold: compactAt, isAutoCompactEnabled: true } as never } : {}),
+  on('session.usage', ($, e) => {
+    if (e.breakdown) {
+      asks.breakdown += 1
+    }
+
+    return {
+      value: {
+        startedAt: session.startedAt,
+        context: {
+          tokens: 68_000,
+          window: 200_000,
+          percent: 34,
+          // 要了分类明细才带上：上下文里装了什么、到多少自动压缩；测试只用得到这几项
+          ...(e.breakdown ? { breakdown: breakdownOf(compactAt) } : {}),
+        },
+        rateLimits: [
+          { kind: 'five_hour', percentUsed: 23, resetsAt: new Date(NOW + 90 * 60_000).toISOString() },
+          { kind: 'seven_day', percentUsed: 41, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
+        ],
+        cost: { usd: session.cost },
       },
-      rateLimits: [
-        { kind: 'five_hour', percentUsed: 23, resetsAt: new Date(NOW + 90 * 60_000).toISOString() },
-        { kind: 'seven_day', percentUsed: 41, resetsAt: new Date(NOW + 3 * 86_400_000).toISOString() },
-      ],
-      cost: { usd: session.cost },
-    },
-  }))
+    }
+  })
   on('session.turns', () => ({ value: 12 }))
   on('session.version', () => ({ value: { version: '2.1.287', base: '2.1.287' } }))
   on('process.run', ($, e) => {
@@ -161,10 +206,14 @@ const world = (
 
       return answer(0, `${CWD}\n${repo.tree}\n\n`)
     }
-    if (e.argv[1] === 'diff') {
+    if (e.argv[1] === 'diff' && e.argv.includes('--numstat')) {
       const [from, to] = e.argv.slice(-2)
 
       return answer(0, repo?.numstat[`${from}..${to}`] ?? '')
+    }
+    // 侧边栏里点开一个文件：git diff … -- 路径
+    if (e.argv[1] === 'diff') {
+      return answer(0, repo?.patches?.[e.argv.at(-1) ?? ''] ?? '')
     }
 
     return answer(0, GIT_STATUS)
@@ -217,6 +266,21 @@ const world = (
 
     return { value: copyResult }
   })
+  on('ui.open', ($, e) => {
+    opened.push(e.id)
+    waiting.splice(0, waiting.length, ...waiting.filter(id => id !== e.id))
+    if (!panes.includes(e.id)) {
+      panes.push(e.id)
+    }
+
+    return { value: { isPlaced: true as const } }
+  })
+  on('ui.panes', () => ({
+    value: [
+      ...panes.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+      ...waiting.map(id => ({ id, title: id, isShown: false, isFocused: false, isPlaced: false })),
+    ],
+  }))
   on('ui.toast', ($, e) => {
     toasts.push(e.text)
 
@@ -1067,15 +1131,25 @@ test('numstat 里改了名的、二进制的、会话目录外的文件都认得
 
 // ---------- 每天花费 ----------
 
-// NOW 是本地 10 月 2 日（周五）20:00
+// NOW 是本地 10 月 2 日（周五）20:00。ccusage 带 --instances 时按项目分：
+// 当前项目 engineering-kit、同级的 license-management、一个临时目录；三个加起来每天是 5、10、40、20、80
 const DAILY = JSON.stringify({
-  daily: [
-    { date: '2026-09-01', totalCost: 5, totalTokens: 1000 },
-    { date: '2026-09-20', totalCost: 10, totalTokens: 1000 },
-    { date: '2026-09-30', totalCost: 40, totalTokens: 1000 },
-    { date: '2026-10-01', totalCost: 20, totalTokens: 1000 },
-    { date: '2026-10-02', totalCost: 80, totalTokens: 1000 },
-  ],
+  projects: {
+    '-Users-me-code-engineering-kit': [
+      { date: '2026-09-01', totalCost: 5, totalTokens: 1000 },
+      { date: '2026-09-20', totalCost: 10, totalTokens: 1000 },
+      { date: '2026-09-30', totalCost: 40, totalTokens: 1000 },
+      { date: '2026-10-01', totalCost: 15, totalTokens: 1000 },
+      { date: '2026-10-02', totalCost: 50, totalTokens: 1000 },
+    ],
+    '-Users-me-code-license-management': [
+      { date: '2026-10-01', totalCost: 5, totalTokens: 1000 },
+      { date: '2026-10-02', totalCost: 28, totalTokens: 1000 },
+    ],
+    '-private-tmp-claude-501-scratchpad-probe': [{ date: '2026-10-02', totalCost: 2, totalTokens: 1000 }],
+    // 在家目录直接开的会话
+    '-Users-me': [{ date: '2026-10-02', totalCost: 0, totalTokens: 10 }],
+  },
   totals: {},
 })
 
@@ -1091,7 +1165,7 @@ test('每天花费：今天、近 7 天、近 30 天，最近 7 天每天一根�
   world(on, {}, { ccusage: DAILY, ccusageRuns })
   await start($)
   // 降低优先级跑，只算最近 30 天
-  expect(ccusageRuns).toEqual([['nice', '-n', '10', 'ccusage', 'daily', '--json', '--since', '20260903']])
+  expect(ccusageRuns).toEqual([['nice', '-n', '10', 'ccusage', 'daily', '--json', '--instances', '--since', '20260903']])
 
   const text = await hudText(await spendTab($))
   expect(text).toContain('今天 $80.00 · 近 7 天 $140.00 · 近 30 天 $150.00')
@@ -1106,6 +1180,40 @@ test('每天花费：今天、近 7 天、近 30 天，最近 7 天每天一根�
     '09/26 周六 -',
   ])
   expect(text).toContain('本机所有会话 · ccusage · 刚刚算的 刷新')
+})
+
+test('每天花费切到「近 7 天按项目」：当前项目标出来，同一个上级目录的只写文件夹名', async ($, on) => {
+  world(on, {}, { ccusage: DAILY })
+  await start($)
+  const ui = await spendTab($)
+  await ui.press({ key: 'spend:project' })
+  const text = await hudText(ui)
+
+  expect(text).toContain('▸ 近 7 天按项目')
+  const rows = text
+    .split('\n')
+    .filter(l => /[█▏▎▍▌▋▊▉]/.test(l))
+    .map(l => l.replace(/│/g, '').trim().replace(/\s+/g, ' '))
+  // 认不出的项目留后面一截
+  expect(rows).toEqual([
+    'engineering-kit（当前） ██████████ $105.00',
+    'license-management ███▏ $33.00',
+    '…de-501-scratchpad-probe ▎ $2.00',
+  ])
+  expect(text).toMatch(/~\s+\$0\.00/)
+
+  await ui.press({ key: 'spend:day' })
+  expect(await hudText(ui)).toContain('10/02 周五')
+})
+
+test('老版本 ccusage 没有按项目的，按天照常；切到按项目说一声', async ($, on) => {
+  const plain = JSON.stringify({ daily: [{ date: '2026-10-02', totalCost: 9, totalTokens: 10 }], totals: {} })
+  world(on, {}, { ccusage: plain })
+  await start($)
+  const ui = await spendTab($)
+  expect(await hudText(ui)).toContain('今天 $9.00')
+  await ui.press({ key: 'spend:project' })
+  expect(await hudText(ui)).toContain('还没有按项目的数，下次刷新就有。')
 })
 
 test('没装 ccusage 时告诉你怎么装', async ($, on) => {
@@ -1256,6 +1364,222 @@ test('两轮之间晚到的上下文读数算到上一轮，只往大了改：�
   }
   expect(withLastContext([turn], 64_000)[0]?.contextAtEnd).toBe(64_000)
   expect(withLastContext([turn], 20_000)[0]?.contextAtEnd).toBe(60_000)
+})
+
+// ---------- 改动侧边栏 ----------
+
+const mountChanges = ($: Engine, rows = 16) =>
+  $.ui.mount({
+    plugin: 'hud',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'hud-changes',
+    props: {
+      title: '改动',
+      isFocused: false,
+      bodyColumns: 60,
+      placement: 'dock',
+      scroll: { offset: 0, bodyRows: rows },
+      view: {},
+    },
+    viewport: { columns: 60, rows, isFullscreen: true },
+  })
+
+// src/a.ts 的改动：两段，一共 12 行
+const PATCH_A = [
+  'diff --git a/src/a.ts b/src/a.ts',
+  'index 1111111..2222222 100644',
+  '--- a/src/a.ts',
+  '+++ b/src/a.ts',
+  '@@ -1,2 +1,3 @@',
+  ' a',
+  '-b',
+  '+c',
+  '+d',
+  '@@ -20,6 +21,6 @@',
+  ' x1',
+  ' x2',
+  '-y',
+  '+z',
+  ' x3',
+  ' x4',
+  '',
+].join('\n')
+
+// 会话开始时是 A；这一轮改了 notes.md 和 src/a.ts，工作区变成 B
+const changedTurn = async ($: Engine, repo: Repo) => {
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  repo.tree = TREE_B
+  repo.numstat[`${TREE_A}..${TREE_B}`] = '7\t0\tnotes.md\0' + '2\t1\tsrc/a.ts\0'
+  await $.tool.call({ tool: 'Bash', command: 'sh edit.sh' })
+  await complete($, 't1')
+}
+
+test('改动侧边栏：git 仓库里启动时自己打开；列出会话开始以来改过的文件，● 是这一轮改过的', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0, patches: { 'src/a.ts': PATCH_A } }
+  const opened: string[] = []
+  world(on, {}, { repo, opened })
+  await start($)
+  expect(opened).toEqual(['hud-changes'])
+  await changedTurn($, repo)
+
+  const ui = await mountChanges($)
+  let text = await hudText(ui)
+  expect(text).toContain('本会话改了 2 个文件 +9 -1 · ● 这一轮改过')
+  expect(text).toMatch(/ ● notes\.md\s+\+7 -0/)
+  expect(text).toMatch(/ ● src\/a\.ts\s+\+2 -1/)
+  expect(text).toContain('点一个文件看它改了什么。')
+
+  // 点开 src/a.ts：只留改动本身，加的绿、删的红；一页放不下就翻页
+  await ui.press({ key: 'file:src/a.ts' })
+  text = await hudText(ui)
+  expect(text).toMatch(/❯● src\/a\.ts/)
+  expect(text).not.toContain('diff --git')
+  expect(text).toContain('@@ -1,2 +1,3 @@')
+  expect(await colorOf(ui, '+c')).toBe('green')
+  expect(await colorOf(ui, '-b')).toBe('red')
+  expect(text).toContain('1/2')
+  expect(text).not.toContain('+z')
+  await ui.press({ key: 'diff:next' })
+  text = await hudText(ui)
+  expect(text).toContain('2/2')
+  expect(text).toContain('+z')
+
+  // 再点一下收起
+  await ui.press({ key: 'file:src/a.ts' })
+  expect(await hudText(ui)).toContain('点一个文件看它改了什么。')
+})
+
+test('不是 git 仓库时不自己打开侧边栏，打开了也说一声看不了', async ($, on) => {
+  const opened: string[] = []
+  world(on, {}, { opened })
+  await start($)
+  expect(opened).toEqual([])
+
+  expect(await hudText(await mountChanges($))).toContain('不是 git 仓库（或者仓库太大），看不了改动。')
+})
+
+test('亲手关过侧边栏的，启动时不再自己打开；从明细里点「在侧边栏看」又打开，以后照常', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  const opened: string[] = []
+  const stored: Record<string, unknown> = { changesPane: 'closed' }
+  world(on, stored, { repo, opened })
+  await start($)
+  expect(opened).toEqual([])
+
+  await changedTurn($, repo)
+  const ui = await expand($, 120)
+  await ui.press({ key: 'changes:open' })
+  expect(opened).toEqual(['hud-changes'])
+  expect(stored.changesPane).toBe('open')
+})
+
+// HUD 第一行最右边「◂ 改动」的字；没放时为 undefined
+const sideOf = async ($: Engine) => {
+  const ui = await mount($)
+  const found = await ui.find({ type: 'Button', key: 'hud:changes' })
+  await ui.unmount()
+
+  return found?.text
+}
+
+test('热重载时侧边栏还开着，不再开第二次', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  const opened: string[] = []
+  world(on, {}, { repo, opened, panes: ['hud-changes'] })
+  await start($)
+  expect(opened).toEqual([])
+  expect(await sideOf($)).toBeUndefined()
+})
+
+test('关过侧边栏后 HUD 第一行最右边是「◂ 改动」，点了拉出来，以后照常自己开；摆出来时 HUD 上不放', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  const opened: string[] = []
+  const stored: Record<string, unknown> = { changesPane: 'closed' }
+  world(on, stored, { repo, opened })
+  await start($)
+  expect(opened).toEqual([])
+
+  const ui = await mount($)
+  // 在 ▸ 那一行的最后
+  expect(screenOf(await ui.drawn())[1]).toMatch(/^▸.*◂ 改动$/)
+  await ui.press({ key: 'hud:changes' })
+  expect(opened).toEqual(['hud-changes'])
+  expect(stored.changesPane).toBe('open')
+  expect(await ui.find({ type: 'Button', key: 'hud:changes' })).toBeUndefined()
+})
+
+test('侧边栏开着但终端太窄还没摆出来时，HUD 上写「◂ 改动」，点了摆出来', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  const opened: string[] = []
+  world(on, {}, { repo, opened, waiting: ['hud-changes'] })
+  await start($)
+  expect(opened).toEqual([])
+
+  const ui = await mount($)
+  expect(await ui.find({ type: 'Button', key: 'hud:changes' })).toMatchObject({ text: '◂ 改动' })
+  await ui.press({ key: 'hud:changes' })
+  expect(opened).toEqual(['hud-changes'])
+  expect(await ui.find({ type: 'Button', key: 'hud:changes' })).toBeUndefined()
+})
+
+test('终端拉宽后侧边栏自己摆出来了，HUD 上的「◂ 改动」几秒内收掉', async ($, on) => {
+  const repo: Repo = { tree: TREE_A, numstat: {}, snapshots: 0 }
+  const panes: string[] = []
+  const waiting = ['hud-changes']
+  const clock = world(on, {}, { repo, panes, waiting })
+  await start($)
+  expect(await sideOf($)).toBe('◂ 改动')
+
+  waiting.length = 0
+  panes.push('hud-changes')
+  await clock.advance(5000)
+  expect(await sideOf($)).toBeUndefined()
+})
+
+test('不是 git 仓库，HUD 上不放「◂ 改动」', async ($, on) => {
+  world(on)
+  await start($)
+  expect(await sideOf($)).toBeUndefined()
+})
+
+// ---------- 上下文里装了什么 ----------
+
+test('上下文里装了什么：占着窗口的几块从大到小，MCP 按服务器、记忆文件各占多少，按需加载的另说', async ($, on) => {
+  world(on)
+  await start($)
+  const ui = await expand($, 120)
+  await ui.press({ key: 'tab:context' })
+  const text = await hudText(ui)
+
+  expect(text).toContain('占着窗口 68k')
+  const rows = text.split('\n').filter(l => /█/.test(l)).map(l => l.replace(/│/g, '').trim().replace(/\s+/g, ' '))
+  expect(rows).toEqual([
+    '对话 ████████████████████ 30k',
+    '内置工具说明 ████████████████ 24k',
+    'MCP 工具说明 ██████ 9k',
+    '系统提示 ██ 3k',
+    '记忆文件 █▍ 2k',
+  ])
+  // 没放进窗口的 jira 不算
+  expect(text).toContain('MCP：figma 6k · slack 3k')
+  expect(text).toContain('记忆文件：CLAUDE.md 1.5k · ~/.claude/CLAUDE.md 500')
+  expect(text).toContain('按需才加载的工具说明 45k，平时不占窗口')
+  expect(text).toContain('估算 · 刚刚估的 刷新')
+})
+
+test('宽窗口里上下文在工具耗时下面；每轮跑完重新估', async ($, on) => {
+  const asks = { breakdown: 0 }
+  world(on, {}, { asks })
+  await start($)
+  const before = asks.breakdown
+  await oneTurn($)
+  await settle()
+  expect(asks.breakdown).toBe(before + 1)
+
+  const text = await hudText(await expand($, 200))
+  expect(text).toContain('上下文')
+  expect(text.indexOf('工具耗时')).toBeLessThan(text.indexOf('占着窗口'))
 })
 
 // ---------- /config 里的门槛 ----------
