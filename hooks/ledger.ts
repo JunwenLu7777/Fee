@@ -52,7 +52,7 @@ export const emptyReceipt = (): HudReceipt => ({
   cacheMiss: null,
 })
 
-export const addUsage = (t: HudTokens | null, u: TurnUsage): HudTokens => ({
+export const addUsage = (t: HudTokens | null, u: Omit<TurnUsage, 'model'>): HudTokens => ({
   input: (t?.input ?? 0) + u.input_tokens,
   output: (t?.output ?? 0) + u.output_tokens,
   cacheRead: (t?.cacheRead ?? 0) + u.cache_read_input_tokens,
@@ -173,19 +173,26 @@ export const withTokens = (r: HudReceipt, u: TurnUsage, isMain: boolean): HudRec
 // ---------- 缓存接没接上 ----------
 
 // 上一次请求至少这么大才看；这次比上次小了三成以上是压缩或清空过，不算；
-// 比上次少读了这么多缓存（至少 1 万、上一次的三成）才算没接上；模型闲了这么久，缓存多半过期了
+// 比上次少读了这么多缓存（至少 1 万、上一次的三成）才算没接上
 const CACHE_MIN_PROMPT = 20_000
 const CACHE_SHRINK = 0.7
 const CACHE_LOST_MIN = 10_000
 const CACHE_LOST_SHARE = 0.3
-export const CACHE_IDLE_MS = 5 * 60_000
+// 缓存能存多久：订阅账号（登录 claude.ai）1 小时，API key 5 分钟；模型闲过这么久，缓存多半过期了
+export const CACHE_TTL_LONG_MS = 60 * 60_000
+export const CACHE_TTL_SHORT_MS = 5 * 60_000
 
 // 一次请求一共多少 token：没缓存的、从缓存读的、写进缓存的
 export const promptOf = (u: TurnUsage) => u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
 
-// 主对话这次请求和上一次比，缓存没接上又说得出原因（模型闲太久、换了模型）才算；
+// 主对话这次请求和上一次比，缓存没接上又说得出原因（模型闲得比缓存能存的还久、换了模型）才算；
 // 别的原因（比如 Claude Code 自己清掉了旧的工具结果）不算，免得常常报
-export const cacheMissOf = (prev: HudStep | null, u: TurnUsage, sentAt: number): HudCacheMiss | null => {
+export const cacheMissOf = (
+  prev: HudStep | null,
+  u: TurnUsage,
+  sentAt: number,
+  ttlMs: number,
+): HudCacheMiss | null => {
   if (!prev || prev.prompt < CACHE_MIN_PROMPT || promptOf(u) < prev.prompt * CACHE_SHRINK) {
     return null
   }
@@ -196,7 +203,7 @@ export const cacheMissOf = (prev: HudStep | null, u: TurnUsage, sentAt: number):
   const idleMs = Math.max(0, sentAt - prev.at)
   const isNewModel = u.model !== prev.model
 
-  return isNewModel || idleMs >= CACHE_IDLE_MS ? { tokens: u.cache_creation_input_tokens, idleMs, isNewModel } : null
+  return isNewModel || idleMs >= ttlMs ? { tokens: u.cache_creation_input_tokens, idleMs, isNewModel } : null
 }
 
 // 一轮里没接上不止一次（比如中间一条命令跑了很久）：重算的加起来，闲得最久的那次

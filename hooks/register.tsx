@@ -3,8 +3,10 @@ import type {
   EngineInterface,
   PluginOptions,
   Register,
+  RenderElement,
   SessionRateLimit,
   SessionUsage,
+  Timer,
   ToolCallResult,
   TurnUsage,
   UiPressArgument,
@@ -13,6 +15,7 @@ import type {
 import type {
   HudActivity,
   HudDaily,
+  HudWarm,
   HudDiff,
   HudFileEdit,
   HudGit,
@@ -30,7 +33,10 @@ import type { Snapshot } from './snapshot'
 import { parseDaily, parseStored } from './spend'
 import { partsOf } from './context'
 import { drawChanges } from './changes'
+import { choiceText, parseChoices } from './choices'
 import {
+  CACHE_TTL_LONG_MS,
+  CACHE_TTL_SHORT_MS,
   EDIT_TOOLS,
   LOOP_EDITS,
   LOOP_FAILS,
@@ -105,6 +111,9 @@ const fileDiff = atom({ plugin: 'hud', key: 'fileDiff' } as const, null)
 // 改动侧边栏摆出来了没有：没摆出来时 HUD 右边才放「◂ 改动」；以引擎记的为准，隔几秒对一次
 const isChangesUp = atom({ plugin: 'hud', key: 'isChangesUp' } as const, false)
 const lastStep = atom({ plugin: 'hud', key: 'lastStep' } as const, null)
+const choices = atom({ plugin: 'hud', key: 'choices' } as const, null)
+const picked = atom({ plugin: 'hud', key: 'picked' } as const, [])
+const warm = atom({ plugin: 'hud', key: 'warm' } as const, null)
 
 const HIDDEN_KEY = 'isHidden'
 // 改动侧边栏：你亲手关掉过就记下，下次启动不再自己打开
@@ -136,6 +145,10 @@ type Config = {
   forecastAfter: number
   // 还能撑几轮以内才在 HUD 上写「约 N 轮后压缩」；0 不写
   compactTurns: number
+  // HUD 最后一行右边的常用指令，点一下就发出去
+  quickPrompts: string[]
+  // 离开时最多续几次缓存（订阅账号每次续 1 小时）；0 不续
+  keepWarmTimes: number
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -144,9 +157,12 @@ const DEFAULT_CONFIG: Config = {
   limitAlert: true,
   forecastAfter: MIN_ELAPSED_SHARE * 100,
   compactTurns: 10,
+  quickPrompts: ['提交+push', '接下来做什么'],
+  keepWarmTimes: 3,
 }
 
 let config = DEFAULT_CONFIG
+const QUICK_MAX = 6
 
 // 设置里存的可能是数字也可能是字符串；不是数就用默认值，超出范围的截到范围里
 const numberOption = (v: unknown, fallback: number, max: number) => {
@@ -161,6 +177,16 @@ const readConfig = (o: PluginOptions): Config => ({
   limitAlert: typeof o.limitAlert === 'boolean' ? o.limitAlert : DEFAULT_CONFIG.limitAlert,
   forecastAfter: numberOption(o.forecastAfter, DEFAULT_CONFIG.forecastAfter, 90),
   compactTurns: numberOption(o.compactTurns, DEFAULT_CONFIG.compactTurns, 100),
+  // 用 | 隔开；留空就不放
+  quickPrompts:
+    typeof o.quickPrompts === 'string'
+      ? o.quickPrompts
+          .split('|')
+          .map(t => t.trim())
+          .filter(Boolean)
+          .slice(0, QUICK_MAX)
+      : DEFAULT_CONFIG.quickPrompts,
+  keepWarmTimes: numberOption(o.keepWarmTimes, DEFAULT_CONFIG.keepWarmTimes, 10),
 })
 
 const forecastShare = () => config.forecastAfter / 100
@@ -389,6 +415,8 @@ type View = {
   tzOffset: number | null
   // 照最近几轮的涨法，还能撑几轮到自动压缩
   compact: CompactForecast | null
+  // 离开时续缓存续了几次
+  warm: HudWarm | null
 }
 
 const DOT: Piece = { text: ' · ', dim: true }
@@ -617,6 +645,12 @@ const turnSegment = ({ activity: a }: View): Variant[] => {
   return [[spin, ...tool, time, tools], [spin, time, tools], [spin, time, tools], [spin, time]]
 }
 
+// 你离开时续过缓存：缓存已续 1/3；这一轮在跑、还没续过时不写
+const warmSegment = ({ warm: w, activity: a }: View): Variant[] =>
+  w && w.refreshes > 0 && !a?.isRunning
+    ? [[{ text: `缓存已续 ${w.refreshes}/${Math.max(w.refreshes, config.keepWarmTimes)}`, dim: true }], []]
+    : [[]]
+
 // 第几轮：本会话里发了几条消息
 const turnsSegment = ({ turns: n }: View): Variant[] => (n ? [[{ text: `#${n}`, dim: true }], []] : [[]])
 
@@ -694,11 +728,13 @@ const WORKSPACE: Row = {
     { id: 'turns', variants: turnsSegment(view) },
     { id: 'agents', variants: agentsSegment(view) },
     { id: 'turn', variants: turnSegment(view) },
+    { id: 'warm', variants: warmSegment(view) },
     { id: 'clock', variants: clockSegment(view) },
     { id: 'version', variants: versionSegment(view) },
   ],
   degrade: [
     'todos', // 去掉当前待办的文字
+    'warm', // 去掉续缓存的次数
     'version', // 去掉版本号
     'git', // 去掉目录名
     'turn', // 去掉当前工具名
@@ -1321,6 +1357,12 @@ const record = async (
 
 // HUD 第一行前面 ▸ 加一个空格的宽度
 const TOGGLE_WIDTH = 2
+// 输入框上方的编号按钮之间空两格
+const CHOICE_GAP = 2
+// HUD 右边几个按钮之间空两格；常用指令窗口不到这么宽就不放，按钮上的字最多这么宽
+const RIGHT_GAP = 2
+const QUICK_MIN_COLUMNS = 90
+const QUICK_LABEL_MAX = 16
 // 改动侧边栏收着时，HUD 第一行最右边放个「◂ 改动」，点了拉出来；摆出来以后用侧边栏右上角自带的 × 关。
 // 关掉后屏幕右上角没有插件能画的地方，只能放这里
 const SHOW_CHANGES = '◂ 改动'
@@ -1393,6 +1435,14 @@ const toggleDetails = async ($: EngineInterface) => {
   }
 }
 
+// 缓存能存多久：订阅账号（登录 claude.ai）1 小时，API key 和别家的接口 5 分钟。启动时问一次登录方式
+let cacheTtlMs = CACHE_TTL_SHORT_MS
+
+const refreshAuth = async ($: EngineInterface) => {
+  const auth = await $.session.authorize().catch(() => null)
+  cacheTtlMs = auth?.kind === 'bearer' ? CACHE_TTL_LONG_MS : CACHE_TTL_SHORT_MS
+}
+
 // 主对话这一轮里的一次请求答完了：缓存没接上又说得出原因就记进小票，再记下这次请求给下一次比。
 // 不是这一轮的请求（别的后台请求）不看，免得被当成换了模型
 const noteStep = async ($: EngineInterface, turnId: string, sentAt: number, used: TurnUsage | null) => {
@@ -1400,7 +1450,7 @@ const noteStep = async ($: EngineInterface, turnId: string, sentAt: number, used
   if (!used || !a?.isRunning || a.turnId !== turnId) {
     return
   }
-  const miss = cacheMissOf(await read($, lastStep), used, sentAt)
+  const miss = cacheMissOf(await read($, lastStep), used, sentAt, cacheTtlMs)
   if (miss) {
     await update($, activity, x =>
       x?.isRunning && x.turnId === turnId ? { ...x, receipt: withCacheMiss(x.receipt, miss) } : x,
@@ -1408,6 +1458,120 @@ const noteStep = async ($: EngineInterface, turnId: string, sentAt: number, used
   }
   const at = await $.clock.now()
   await update($, lastStep, () => ({ at, prompt: promptOf(used), model: used.model }))
+}
+
+// ---------- 离开时续缓存 ----------
+
+// 订阅账号的缓存存 1 小时：主对话最后一次请求后 55 分钟还没动静，就拿当前对话再问一句「只回复 OK」，
+// 读一遍缓存让它重新算 1 小时，你回来时不用把整段上下文重新算一遍；最多续几次在 /config 里改。
+// 上下文太小的不续（续一次和重新算差不多）；API key 的缓存只存 5 分钟，几分钟就得续一次，不做
+const WARM_AFTER_MS = 55 * 60_000
+const WARM_MIN_TOKENS = 30_000
+// 该续的时间已经过了这么久（热重载、电脑睡着过），缓存多半已经过期，不补了
+const WARM_LAPSED_MS = 5 * 60_000
+const WARM_PROMPT = '只回复 OK'
+let warmTimer: Timer | null = null
+
+const armWarm = ($: EngineInterface, dueAt: number, at: number) => {
+  warmTimer?.cancel()
+  warmTimer = $.clock.after(Math.max(0, dueAt - at), () => void keepWarm($).catch(() => undefined))
+}
+
+// 你回来了（新的一轮）、压缩过、换了会话：不用再续
+const stopWarm = async ($: EngineInterface) => {
+  warmTimer?.cancel()
+  warmTimer = null
+  if (await read($, warm)) {
+    await update($, warm, () => null)
+  }
+}
+
+// 这一轮跑完：从主对话最后一次请求算起，55 分钟后续第一次
+const planWarm = async ($: EngineInterface) => {
+  const step = await read($, lastStep)
+  if (cacheTtlMs !== CACHE_TTL_LONG_MS || config.keepWarmTimes === 0 || !step) {
+    await stopWarm($)
+
+    return
+  }
+  const dueAt = step.at + WARM_AFTER_MS
+  await update($, warm, () => ({ dueAt, refreshes: 0 }))
+  armWarm($, dueAt, await $.clock.now())
+}
+
+const keepWarm = async ($: EngineInterface) => {
+  warmTimer = null
+  const [w, a, s, now] = await Promise.all([read($, warm), read($, activity), read($, stats), $.clock.now()])
+  if (!w || w.dueAt == null || a?.isRunning) {
+    return
+  }
+  // 电脑睡着过、计时器晚了太久：缓存已经过期，续也是把整段重新算一遍，不续了
+  const isLapsed = now - w.dueAt > WARM_LAPSED_MS
+  if (isLapsed || w.refreshes >= config.keepWarmTimes || (s?.contextTokens ?? 0) < WARM_MIN_TOKENS) {
+    await update($, warm, x => (x ? { ...x, dueAt: null } : x))
+
+    return
+  }
+  const r = await $.model.fork({ prompt: WARM_PROMPT }).catch(() => null)
+  const at = await $.clock.now()
+  // 续这一次用的 token 也算进本会话的
+  if (r && 'usage' in r) {
+    const used = r.usage
+    await update($, tokens, t => addUsage(t, used))
+  }
+  // 缓存刚续上：下一次真请求从这时算模型闲了多久（请求多大、哪个模型照旧）
+  if (r?.isAnswered) {
+    await update($, lastStep, p => (p ? { ...p, at } : p))
+  }
+  const refreshes = w.refreshes + 1
+  const dueAt = refreshes < config.keepWarmTimes ? at + WARM_AFTER_MS : null
+  await update($, warm, () => ({ dueAt, refreshes }))
+  if (dueAt != null) {
+    armWarm($, dueAt, at)
+  }
+}
+
+// 热重载会丢掉计时器：照记下的时间重新排；已经过了太久的不补
+const resumeWarm = async ($: EngineInterface) => {
+  const [w, at] = await Promise.all([read($, warm), $.clock.now()])
+  if (!w || w.dueAt == null || warmTimer) {
+    return
+  }
+  if (w.dueAt - at < -WARM_LAPSED_MS) {
+    await update($, warm, x => (x ? { ...x, dueAt: null } : x))
+
+    return
+  }
+  armWarm($, w.dueAt, at)
+}
+
+// ---------- 按钮替你发的话 ----------
+
+// 输入框是空的就直接发出去，算你自己说的；已经打了字就另起一行接在后面，不替你发，免得把没打完的话发出去
+const sendOrFill = async ($: EngineInterface, text: string) => {
+  const box = await $.prompt.read().catch(() => null)
+  if ((box?.text.trim() ?? '') !== '') {
+    const done = await $.prompt.fill({ text: `\n${text}`, mode: 'append' }).catch(() => null)
+    if (!done?.isFilled) {
+      $.ui.toast('输入框现在放不进去（可能开着别的对话框）', { timeoutMs: 3000 })
+    }
+
+    return
+  }
+  await $.prompt.submit({ text, asUser: true })
+}
+
+// 回复里的编号按钮：点一下选上，再点取消，按点的先后记
+const pickChoice = ($: EngineInterface, n: number) =>
+  update($, picked, list => (list.includes(n) ? list.filter(x => x !== n) : [...list, n]))
+
+const sendChoices = async ($: EngineInterface) => {
+  const list = await read($, picked)
+  if (list.length === 0) {
+    return
+  }
+  await update($, picked, () => [])
+  await sendOrFill($, choiceText(list))
 }
 
 const tick = async ($: EngineInterface) => {
@@ -1455,8 +1619,10 @@ export const register: Register = (on, options) => {
     await refreshTurns($)
     await refreshVersion($)
     await refreshOffset($)
+    await refreshAuth($)
     await checkLimits($)
     void refreshFable($)
+    void resumeWarm($).catch(() => undefined)
     void initBaseline($)
       .then(() => autoOpenChanges($))
       .then(async () => {
@@ -1474,6 +1640,10 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // 你回话了（点了按钮，或者自己打的）：上一段回复的编号按钮收掉；人回来了，不用再续缓存
+    await update($, choices, () => null)
+    await update($, picked, () => [])
+    await stopWarm($)
     const [startedAt, s] = await Promise.all([$.clock.now(), read($, stats)])
     const cost = s?.costUsd ?? null
     // 上一轮的花费算到这一轮开始为止
@@ -1577,6 +1747,11 @@ export const register: Register = (on, options) => {
         pushTurn(log, toTurn(finished, e.durationMs, e.reason, s?.costUsd ?? null, s?.contextTokens ?? null)),
       )
     }
+    // 回复里有让你挑的编号，在输入框上方画成按钮；被中断、出错的不算
+    const items = e.reason === 'answer' ? parseChoices(e.answer) : []
+    await update($, choices, () => (items.length >= 2 ? { turnId: e.turnId, items } : null))
+    await update($, picked, () => [])
+    await planWarm($)
     await refreshNow($)
     await refreshGit($)
     await refreshAgents($)
@@ -1618,6 +1793,7 @@ export const register: Register = (on, options) => {
     if (e.agentId == null && e.trigger !== 'precompute' && !('skip' in done && done.skip)) {
       await update($, activity, a => (a?.isRunning ? { ...a, isCompacted: true } : a))
       await update($, lastStep, () => null)
+      await stopWarm($)
     }
 
     return done
@@ -1671,6 +1847,9 @@ export const register: Register = (on, options) => {
     await update($, changesView, () => ({ path: null, page: 0, turn: null }))
     await update($, fileDiff, () => null)
     await update($, lastStep, () => null)
+    await update($, choices, () => null)
+    await update($, picked, () => [])
+    await stopWarm($)
     await refreshTurns($)
     void initBaseline($).catch(() => undefined)
 
@@ -1837,6 +2016,78 @@ export const register: Register = (on, options) => {
     )
   })
 
+  // 我回复里让你挑的编号，在输入框上方画成按钮：点选（可以多选），再点「发送」，按点的先后发出去（15、1423）。
+  // 被问卷占着、回合在跑、HUD 关着时不画；你回了话（新的一轮开始）就收掉，点 × 也收掉
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const rest = await next(e)
+    const [list, sel, hidden] = await Promise.all([read($, choices), read($, picked), read($, isHidden)])
+    if (!list || hidden || e.props.hasSurvey || e.props.isWorking) {
+      return rest
+    }
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const prefix = '点选（可多选）：'
+    const send = `发送 ${choiceText(sel)}`
+    const cells: { width: number; node: RenderElement }[] = [
+      { width: cellWidth(prefix), node: <Text dimColor>{prefix}</Text> },
+      ...list.items.map(c => {
+        const isOn = sel.includes(c.n)
+        const label = `${isOn ? '●' : '○'} ${c.n} ${c.label}`
+
+        return {
+          width: cellWidth(label),
+          node: (
+            <Button key={`choice:${c.n}`} plain {...(isOn ? {} : { dimColor: true })} onPress={() => void pickChoice($, c.n)}>
+              {label}
+            </Button>
+          ),
+        }
+      }),
+      // 「发送」画成 [ 发送 15 ]，比两边宽 4 格
+      ...(sel.length
+        ? [
+            {
+              width: cellWidth(send) + 4,
+              node: (
+                <Button key="choice:send" variant="primary" onPress={() => void sendChoices($).catch(() => undefined)}>
+                  {send}
+                </Button>
+              ),
+            },
+          ]
+        : []),
+      {
+        width: 1,
+        node: (
+          <Button key="choice:close" plain dimColor role="dismiss" onPress={() => void update($, choices, () => null)}>
+            ×
+          </Button>
+        ),
+      },
+    ]
+    // 一个接一个排，一行放不下就换行
+    const width = Math.max(20, e.props.bodyColumns)
+    const rows = cells.reduce<(typeof cells)[]>((done, c) => {
+      const row = done.at(-1)
+      const used = row ? row.reduce((n, x) => n + x.width + CHOICE_GAP, 0) : 0
+      if (row && used + c.width <= width) {
+        row.push(c)
+
+        return done
+      }
+
+      return [...done, [c]]
+    }, [])
+
+    return (
+      <Box flexDirection="column">
+        {rows.map(r => (
+          <Box columnGap={CHOICE_GAP}>{r.map(c => c.node)}</Box>
+        ))}
+        {rest}
+      </Box>
+    )
+  })
+
   // 第一行照常是引擎自己的提示（⏵⏵ bypass permissions 等），HUD 另起两行（窄窗口三行）画在它下面。
   // HUD 第一行最前面的 ▸ 点一下在下方展开明细（每轮花费和 token、工具耗时、子 agent），变成 ▾，再点收起
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
@@ -1846,7 +2097,7 @@ export const register: Register = (on, options) => {
     }
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded, log, threshold, base, isUp] =
+    const [s, id, level, g, d, a, at, t, df, td, n, fb, tn, v, tz, expanded, log, threshold, base, isUp, w] =
       await Promise.all([
         read($, stats),
         read($, modelId),
@@ -1868,6 +2119,7 @@ export const register: Register = (on, options) => {
         read($, compactAt),
         read($, baseTree),
         read($, isChangesUp),
+        read($, warm),
       ])
     const view: View = {
       stats: s,
@@ -1886,17 +2138,29 @@ export const register: Register = (on, options) => {
       version: v,
       tzOffset: tz,
       compact: compactForecast(log, s?.contextTokens ?? null, threshold),
+      warm: w,
     }
     const viewportColumns = e.viewport?.columns ?? 120
     // 每行前面留两格给 ▸
     const columns = Math.max(20, viewportColumns - 4 - TOGGLE_WIDTH)
-    // 侧边栏收着、又是 git 仓库（不是仓库的看不了改动）才放「◂ 改动」；第一行右边给它留出位置
+    // 侧边栏收着、又是 git 仓库（不是仓库的看不了改动）才放「◂ 改动」，在第一行右边；
+    // 常用指令在窗口够宽、这一轮没在跑时放，在最后一行右边；只有一行时两样都在这行。各行先给它们留出位置
     const side = base && !isUp ? SHOW_CHANGES : null
-    const sideWidth = side ? cellWidth(side) + 1 : 0
-    const rows = layout(viewportColumns).reduce<Variant[][]>((drawn, row) => {
-      const groups = fit(row.segments(view), row.degrade, drawn.length === 0 ? columns - sideWidth : columns)
+    const quick = !a?.isRunning && viewportColumns >= QUICK_MIN_COLUMNS ? config.quickPrompts : []
+    const rightWidth = (isFirst: boolean, isLast: boolean) => {
+      const widths = [
+        ...(isFirst && side ? [cellWidth(side)] : []),
+        ...(isLast ? quick.map(q => cellWidth(clip(q, QUICK_LABEL_MAX))) : []),
+      ]
 
-      return groups.length > 0 ? [...drawn, groups] : drawn
+      return widths.length ? 1 + widths.reduce((sum, w) => sum + w, 0) + RIGHT_GAP * (widths.length - 1) : 0
+    }
+    const plan = layout(viewportColumns)
+    const rows = plan.reduce<{ groups: Variant[]; isLast: boolean }[]>((drawn, row, i) => {
+      const isLast = i === plan.length - 1
+      const groups = fit(row.segments(view), row.degrade, columns - rightWidth(drawn.length === 0, isLast))
+
+      return groups.length > 0 || (isLast && quick.length > 0) ? [...drawn, { groups, isLast }] : drawn
     }, [])
 
     const draw = (groups: Variant[]) =>
@@ -1920,13 +2184,32 @@ export const register: Register = (on, options) => {
         </Button>
       </Box>
     )
-    const sideToggle = side && (
-      <Box flexGrow={1} flexShrink={0} justifyContent="flex-end" marginLeft={1}>
-        <Button key="hud:changes" plain dimColor onPress={() => void openChanges($).catch(() => undefined)}>
-          {side}
-        </Button>
-      </Box>
-    )
+    const right = (isFirst: boolean, isLast: boolean) => {
+      const buttons = [
+        ...(isFirst && side
+          ? [
+              <Button key="hud:changes" plain dimColor onPress={() => void openChanges($).catch(() => undefined)}>
+                {side}
+              </Button>,
+            ]
+          : []),
+        ...(isLast
+          ? quick.map((q, i) => (
+              <Button key={`quick:${i}`} plain dimColor onPress={() => void sendOrFill($, q).catch(() => undefined)}>
+                {clip(q, QUICK_LABEL_MAX)}
+              </Button>
+            ))
+          : []),
+      ]
+
+      return (
+        buttons.length > 0 && (
+          <Box flexGrow={1} flexShrink={0} justifyContent="flex-end" marginLeft={1} columnGap={RIGHT_GAP}>
+            {buttons}
+          </Box>
+        )
+      )
+    }
     const shown = expanded ? await detailsOf($, columns, e.viewport?.rows ?? 40) : null
     const details = shown
       ? drawDetails({ Box, Text, Button }, shown.data, shown.size, {
@@ -1940,15 +2223,15 @@ export const register: Register = (on, options) => {
 
     // 引擎自己的那行不能放在带 width 的 Box 里，否则整棵树会被拒绝，外层只靠 column 拉伸。
     // 每行从左往右连着画，不往右顶：宽屏上贴右边的内容离左边太远，看着像不属于 HUD。
-    // 第一行前面是 ▸，其他行空出同样宽，和第一行对齐；只有「◂ 改动」贴最右边
+    // 第一行前面是 ▸，其他行空出同样宽，和第一行对齐；只有「◂ 改动」和常用指令贴最右边
     return (
       <Box flexDirection="column">
         {line}
-        {rows.map((groups, i) => (
+        {rows.map(({ groups, isLast }, i) => (
           <Box width="100%" {...(i ? { paddingLeft: TOGGLE_WIDTH } : {})}>
             {i === 0 && toggle}
             <Text wrap="truncate-end">{draw(groups)}</Text>
-            {i === 0 && sideToggle}
+            {right(i === 0, isLast)}
           </Box>
         ))}
         {details && (

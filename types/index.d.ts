@@ -124,6 +124,24 @@ export type HudStep = {
   model: string
 }
 
+// 我最后那段回复里让你挑的一项：编号和一个短名字
+export type HudChoice = {
+  n: number
+  label: string
+}
+
+// 最后那段回复里的编号选项，在输入框上方画成按钮；不是让你挑的列表为 null
+export type HudChoices = {
+  turnId: string
+  items: HudChoice[]
+}
+
+// 离开时续缓存：下一次什么时候续、这次离开已经续了几次；不续了为 null
+export type HudWarm = {
+  dueAt: number | null
+  refreshes: number
+}
+
 // 一种工具在本会话里的调用次数和耗时
 export type HudToolStat = {
   name: string
@@ -305,6 +323,11 @@ declare module 'claude-code' {
       isChangesUp: boolean
       // 主对话上一次请求模型，看下一次缓存接没接上
       lastStep: HudStep | null
+      // 最后那段回复里的编号选项，和你已经点选的（按点的先后）
+      choices: HudChoices | null
+      picked: number[]
+      // 离开时续缓存的进度
+      warm: HudWarm | null
     }
   }
 }

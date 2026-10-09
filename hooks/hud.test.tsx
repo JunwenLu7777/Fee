@@ -76,6 +76,9 @@ type World = {
   waiting?: string[]
   // 主对话每次请求模型答回来的用量，按顺序一次用一个；用完了答 null
   steps?: (TurnUsage | null)[]
+  // 记下续缓存时拿当前对话问的话，和按钮替你发出去的话
+  forks?: string[]
+  submitted?: string[]
 }
 
 // patches：点开一个文件时 git diff 答的内容，先按「从..到 路径」查，没有再按路径查；null 是 git 读不出来（快照被清理了）
@@ -133,6 +136,8 @@ const world = (
     panes = [],
     waiting = [],
     steps = [],
+    forks = [],
+    submitted = [],
   }: World = {},
 ) => {
   const clock = mock.clock(on, { now: NOW })
@@ -294,6 +299,25 @@ const world = (
 
     return { value: undefined }
   })
+  // 续缓存：拿当前对话问一句，几乎全从缓存读
+  on('model.fork', ($, e) => {
+    forks.push(e.prompt)
+
+    return {
+      value: {
+        isAnswered: true as const,
+        text: 'OK',
+        usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 0 },
+      },
+    }
+  })
+  on('prompt.submit', ($, e) => {
+    submitted.push(e.text)
+
+    return { text: e.text }
+  })
+  // 代替引擎画输入框上方那一栏：没有问卷时什么都不画
+  on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'engine', ref: 0 }) as const)
 
   return clock
 }
@@ -1962,8 +1986,8 @@ const askedTurn = async ($: Engine, turnId: string) => {
 
 const lastReceipt = async ($: Engine) => (await footerOf($, 1000)).join('\n')
 
-test('模型闲了 6 分钟缓存没接上：小票写「缓存过期」，明细里说闲了多久，in 标黄', async ($, on) => {
-  const clock = world(on, {}, { steps: [usageOf(0, 100_000), usageOf(20_000, 85_000)] })
+test('API key 的缓存存 5 分钟：模型闲了 6 分钟缓存没接上，小票写「缓存过期」，明细里说闲了多久，in 标黄', async ($, on) => {
+  const clock = world(on, {}, { authKind: 'api-key', steps: [usageOf(0, 100_000), usageOf(20_000, 85_000)] })
   await start($)
   await askedTurn($, 't1')
   expect(await lastReceipt($)).not.toContain('缓存')
@@ -2009,7 +2033,7 @@ test('缓存接上了、上下文变小了（压缩过）、说不出原因的�
 })
 
 test('一轮中间一条命令跑了很久，缓存也会过期：重算的加起来，写闲得最久的那次', async ($, on) => {
-  const clock = world(on, {}, { steps: [usageOf(0, 100_000), usageOf(0, 101_000), usageOf(0, 102_000)] })
+  const clock = world(on, {}, { authKind: 'api-key', steps: [usageOf(0, 100_000), usageOf(0, 101_000), usageOf(0, 102_000)] })
   await start($)
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await stepOf($, 't1', 0)
@@ -2022,4 +2046,192 @@ test('一轮中间一条命令跑了很久，缓存也会过期：重算的加�
 
   const ui = await expand($, 120)
   expect(await hudText(ui)).toContain('模型闲了 8m，缓存多半过期了，203k 上下文重新算了一遍')
+})
+
+test('订阅账号的缓存存 1 小时：闲了 10 分钟没接上不算过期，闲了一个多小时才算', { options: { keepWarmTimes: 0 } }, async ($, on) => {
+  const clock = world(on, {}, { steps: [usageOf(0, 100_000), usageOf(0, 101_000), usageOf(0, 102_000)] })
+  await start($)
+  await askedTurn($, 't1')
+  await clock.advance(10 * 60_000)
+  await askedTurn($, 't2')
+  expect(await lastReceipt($)).not.toContain('缓存')
+
+  await passes(clock, 61 * 60_000)
+  await askedTurn($, 't3')
+  expect(await lastReceipt($)).toContain('缓存过期，重算 102k')
+  const ui = await expand($, 120)
+  expect(await hudText(ui)).toContain('模型闲了 1h1m，缓存多半过期了')
+})
+
+// ---------- 离开时续缓存 ----------
+
+// 一次拨太久，每秒一次的计时器会超出测试工具一次能跑的上限，分成半小时一段拨
+const passes = async (clock: { advance: (ms: number) => Promise<unknown> }, ms: number) => {
+  for (let left = ms; left > 0; left -= 30 * 60_000) {
+    await clock.advance(Math.min(left, 30 * 60_000))
+  }
+}
+
+test('订阅账号离开时续缓存：最后一次请求后 55 分钟续一次，最多三次；回来了就不续', async ($, on) => {
+  const forks: string[] = []
+  const clock = world(on, {}, { forks, steps: [usageOf(0, 100_000), usageOf(100_000, 2_000)] })
+  await start($)
+  await askedTurn($, 't1')
+  await passes(clock, 54 * 60_000)
+  expect(forks).toEqual([])
+
+  await clock.advance(60_000)
+  expect(forks).toEqual(['只回复 OK'])
+  expect((await rowsOf($))[2]).toContain('缓存已续 1/3')
+
+  await passes(clock, 55 * 60_000)
+  expect(forks).toHaveLength(2)
+  expect((await rowsOf($))[2]).toContain('缓存已续 2/3')
+
+  // 你回来了：这一轮接上了缓存（续过就不算过期），之后从这一轮重新算
+  await askedTurn($, 't2')
+  expect(await lastReceipt($)).not.toContain('缓存')
+  expect((await rowsOf($))[2]).not.toContain('缓存已续')
+  await $.turn.start({ text: 'again', turnId: 't3' })
+  await passes(clock, 3 * 60 * 60_000)
+  expect(forks).toHaveLength(2)
+})
+
+test('续满三次就不续了', async ($, on) => {
+  const forks: string[] = []
+  const clock = world(on, {}, { forks, steps: [usageOf(0, 100_000)] })
+  await start($)
+  await askedTurn($, 't1')
+  await passes(clock, 5 * 60 * 60_000)
+  expect(forks).toHaveLength(3)
+  expect((await rowsOf($))[2]).toContain('缓存已续 3/3')
+})
+
+test('API key 不续缓存', async ($, on) => {
+  const forks: string[] = []
+  const clock = world(on, {}, { authKind: 'api-key', forks, steps: [usageOf(0, 100_000)] })
+  await start($)
+  await askedTurn($, 't1')
+  await passes(clock, 2 * 60 * 60_000)
+  expect(forks).toEqual([])
+})
+
+// ---------- 回复里的编号变成按钮 ----------
+
+const MENU = [
+  '推荐先做 1 和 2。',
+  '',
+  '1. **侧边栏按轮看改动**：在明细里点某一轮，侧边栏就只显示那一轮。',
+  '2. **在侧边栏里点文件，直接用编辑器打开**：跳到第一处改动。',
+  '   - 没装 VS Code 就用系统默认程序',
+  '3. 花费上限提醒，在 /config 里设。',
+  '',
+  '挑号码告诉我就行，可以多选。',
+].join('\n')
+
+const mountBand = ($: Engine, isWorking = false) =>
+  $.ui.mount({
+    plugin: 'hud',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+    viewport: { columns: 120, rows: 40, isFullscreen: true },
+  })
+
+test('回复里让你挑的编号画成输入框上方的按钮：点选几个，按点的先后发出去', async ($, on) => {
+  const submitted: string[] = []
+  world(on, {}, { submitted })
+  await start($)
+  await $.turn.start({ text: '接下来做什么', turnId: 't1' })
+  await complete($, 't1', { answer: MENU })
+
+  const ui = await mountBand($)
+  let text = await hudText(ui)
+  expect(text).toContain('点选（可多选）：')
+  expect(text).toContain('○ 1 侧边栏按轮看改动')
+  expect(text).toContain('○ 2 在侧边栏里点文件  ')
+  expect(text).toContain('○ 3 花费上限提醒')
+  expect(await ui.find({ type: 'Button', key: 'choice:send' })).toBeUndefined()
+
+  await ui.press({ key: 'choice:3' })
+  await ui.press({ key: 'choice:1' })
+  text = await hudText(ui)
+  expect(text).toContain('● 3 花费上限提醒')
+  expect(await ui.find({ type: 'Button', key: 'choice:send' })).toMatchObject({ text: '发送 31' })
+
+  await ui.press({ key: 'choice:send' })
+  expect(submitted).toEqual(['31'])
+  // 你回了话，新的一轮开始，按钮收掉
+  await $.turn.start({ text: '31', turnId: 't2' })
+  expect(await ui.find({ type: 'Button', key: 'choice:1' })).toBeUndefined()
+})
+
+test('输入框里已经打了字，点发送不替你发，接在后面', async ($, on) => {
+  const submitted: string[] = []
+  const filled: string[] = []
+  world(on, {}, { submitted })
+  on('prompt.read', () => ({
+    value: { text: '先做', cursor: 2, model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'] },
+  }))
+  on('prompt.fill', ($, e) => {
+    filled.push(e.text)
+
+    return { isFilled: true }
+  })
+  await start($)
+  await $.turn.start({ text: '接下来做什么', turnId: 't1' })
+  await complete($, 't1', { answer: MENU })
+
+  const ui = await mountBand($)
+  await ui.press({ key: 'choice:2' })
+  await ui.press({ key: 'choice:send' })
+  expect(submitted).toEqual([])
+  expect(filled).toEqual(['\n2'])
+})
+
+test('不是让你挑的编号清单不画按钮；回合在跑时不画；点 × 收掉', async ($, on) => {
+  world(on)
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await complete($, 't1', {
+    answer: ['请你帮我看一下：', '', '1. 开关是不是贴着最右边。', '2. 不到 110 列时侧边栏在输入框上方。', '', '如果不对，告诉我。'].join('\n'),
+  })
+  expect(await hudText(await mountBand($))).not.toContain('点选')
+
+  await $.turn.start({ text: '接下来做什么', turnId: 't2' })
+  await complete($, 't2', { answer: MENU })
+  expect(await hudText(await mountBand($, true))).not.toContain('点选')
+  const ui = await mountBand($)
+  expect(await hudText(ui)).toContain('点选')
+  await ui.press({ key: 'choice:close' })
+  expect(await hudText(ui)).not.toContain('点选')
+})
+
+// ---------- 常用指令按钮 ----------
+
+test('HUD 最后一行右边是常用指令，点一下发出去；回合在跑、窗口太窄时不放', async ($, on) => {
+  const submitted: string[] = []
+  world(on, {}, { submitted })
+  await start($)
+
+  const ui = await mount($, 200)
+  expect(screenOf(await ui.drawn())[2]).toMatch(/v2\.1\.287\s*提交\+push  接下来做什么$/)
+  await ui.press({ key: 'quick:0' })
+  expect(submitted).toEqual(['提交+push'])
+
+  await $.turn.start({ text: '提交+push', turnId: 't1' })
+  expect(await ui.find({ type: 'Button', key: 'quick:0' })).toBeUndefined()
+  await complete($, 't1')
+  expect(await ui.find({ type: 'Button', key: 'quick:1' })).toMatchObject({ text: '接下来做什么' })
+  const narrow = await mount($, 80)
+  expect(await narrow.find({ type: 'Button', key: 'quick:0' })).toBeUndefined()
+})
+
+test('常用指令在 /config 里改，用 | 隔开', { options: { quickPrompts: '跑测试 | 看看 diff' } }, async ($, on) => {
+  world(on)
+  await start($)
+  const ui = await mount($, 200)
+  expect(await ui.find({ type: 'Button', key: 'quick:0' })).toMatchObject({ text: '跑测试' })
+  expect(await ui.find({ type: 'Button', key: 'quick:1' })).toMatchObject({ text: '看看 diff' })
+  expect(await ui.find({ type: 'Button', key: 'quick:2' })).toBeUndefined()
 })
