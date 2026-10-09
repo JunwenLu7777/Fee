@@ -74,10 +74,12 @@ type World = {
   opened?: string[]
   panes?: string[]
   waiting?: string[]
+  // 主对话每次请求模型答回来的用量，按顺序一次用一个；用完了答 null
+  steps?: (TurnUsage | null)[]
 }
 
-// patches：点开一个文件时 git diff 答的内容，按路径查
-type Repo = { tree: string; numstat: Record<string, string>; snapshots: number; patches?: Record<string, string> }
+// patches：点开一个文件时 git diff 答的内容，先按「从..到 路径」查，没有再按路径查；null 是 git 读不出来（快照被清理了）
+type Repo = { tree: string; numstat: Record<string, string>; snapshots: number; patches?: Record<string, string | null> }
 
 // Claude Code 估的上下文明细：对话 30k、内置工具 24k、MCP 9k、系统提示 3k、记忆文件 2k 占着窗口；
 // 另有 45k 按需加载的工具说明不占窗口
@@ -130,6 +132,7 @@ const world = (
     opened = [],
     panes = [],
     waiting = [],
+    steps = [],
   }: World = {},
 ) => {
   const clock = mock.clock(on, { now: NOW })
@@ -211,9 +214,14 @@ const world = (
 
       return answer(0, repo?.numstat[`${from}..${to}`] ?? '')
     }
-    // 侧边栏里点开一个文件：git diff … -- 路径
+    // 侧边栏里点开一个文件：git diff … 从 到 -- 路径
     if (e.argv[1] === 'diff') {
-      return answer(0, repo?.patches?.[e.argv.at(-1) ?? ''] ?? '')
+      const [from, to] = e.argv.slice(5, 7)
+      const path = e.argv.at(-1) ?? ''
+      const patches = repo?.patches ?? {}
+      const patch = `${from}..${to} ${path}` in patches ? patches[`${from}..${to} ${path}`] : patches[path]
+
+      return patch === null ? answer(128, '') : answer(0, patch ?? '')
     }
 
     return answer(0, GIT_STATUS)
@@ -223,7 +231,7 @@ const world = (
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer, ...(e.usage ? { usage: e.usage } : {}) }))
   on('turn.step', async function* ($, e) {
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: steps.shift() ?? null }
   })
   on('tool.call', { tool: 'Edit' }, () => ({
     result: {
@@ -1543,6 +1551,61 @@ test('不是 git 仓库，HUD 上不放「◂ 改动」', async ($, on) => {
   expect(await sideOf($)).toBeUndefined()
 })
 
+// 第二轮：工作区从 B 变成 C，只改了 src/b.ts
+const PATCH_B = ['diff --git a/src/b.ts b/src/b.ts', '@@ -0,0 +1,3 @@', '+x', '+y', '+z', ''].join('\n')
+
+const secondTurn = async ($: Engine, repo: Repo) => {
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  repo.tree = TREE_C
+  repo.numstat[`${TREE_A}..${TREE_C}`] = '7\t0\tnotes.md\0' + '2\t1\tsrc/a.ts\0' + '3\t0\tsrc/b.ts\0'
+  repo.numstat[`${TREE_B}..${TREE_C}`] = '3\t0\tsrc/b.ts\0'
+  await $.tool.call({ tool: 'Bash', command: 'sh more.sh' })
+  await complete($, 't2')
+}
+
+test('在明细里点一轮的「在侧边栏看 ›」，侧边栏只看那一轮；上一轮、下一轮翻，看整个会话回去', async ($, on) => {
+  const repo: Repo = {
+    tree: TREE_A,
+    numstat: {},
+    snapshots: 0,
+    // 第二轮的 src/b.ts 只有按那一轮的两张快照比才有；第一轮的快照被 git 清理掉了
+    patches: { [`${TREE_B}..${TREE_C} src/b.ts`]: PATCH_B, [`${TREE_A}..${TREE_B} src/a.ts`]: null },
+  }
+  world(on, {}, { repo })
+  await start($)
+  await changedTurn($, repo)
+  await secondTurn($, repo)
+
+  // 选第一轮，点「在侧边栏看 ›」
+  const details = await expand($, 120)
+  await details.press({ key: 'turn:t1' })
+  await details.press({ key: 'changes:open' })
+
+  const ui = await mountChanges($)
+  let text = await hudText(ui)
+  expect(text).toContain('第 12 轮改了 2 个文件 +9 -1')
+  expect(text).toMatch(/‹ 上一轮\s+下一轮 ›\s+看整个会话/)
+  expect(await ui.find({ type: 'Button', key: 'changes:prev' })).toBeUndefined()
+  expect(text).toMatch(/notes\.md\s+\+7 -0/)
+  expect(text).not.toContain('src/b.ts')
+  await ui.press({ key: 'file:src/a.ts' })
+  expect(await hudText(ui)).toContain('快照找不到了（可能被 git 清理了），看不了具体改了哪几行。')
+
+  // 下一轮只改了一个文件，直接点开
+  await ui.press({ key: 'changes:next' })
+  text = await hudText(ui)
+  expect(text).toContain('第 12 轮改了 1 个文件 +3 -0')
+  expect(text).toMatch(/❯\s+src\/b\.ts/)
+  expect(text).toContain('@@ -0,0 +1,3 @@')
+  expect(await ui.find({ type: 'Button', key: 'changes:next' })).toBeUndefined()
+
+  // 回到整个会话；再点「按轮看 ›」从最近改过文件的那一轮看起
+  await ui.press({ key: 'changes:session' })
+  expect(await hudText(ui)).toContain('本会话改了 3 个文件 +12 -1')
+  await ui.press({ key: 'changes:turns' })
+  expect(await hudText(ui)).toContain('第 12 轮改了 1 个文件 +3 -0')
+})
+
 // ---------- 上下文里装了什么 ----------
 
 test('上下文里装了什么：占着窗口的几块从大到小，MCP 按服务器、记忆文件各占多少，按需加载的另说', async ($, on) => {
@@ -1871,4 +1934,92 @@ test('点子 agent 看它的模型、任务和交回来的报告，再点收起'
 
   await ui.press({ key: 'agent:a1' })
   expect(await hudText(ui)).not.toContain('报告')
+})
+
+// ---------- 缓存过期的轮次 ----------
+
+// 一次请求的用量：从缓存读了 read、写进缓存 write
+const usageOf = (read: number, write: number, model = 'claude-opus-5-5'): TurnUsage => ({
+  model,
+  input_tokens: 500,
+  output_tokens: 800,
+  cache_read_input_tokens: read,
+  cache_creation_input_tokens: write,
+})
+
+const stepOf = async ($: Engine, turnId: string, index: number) => {
+  for await (const _ of $.turn.step({ turnId, index, model: 'claude-opus-5-5', messageCount: 1 })) {
+    // 读完这一步的流
+  }
+}
+
+// 一轮：请求一次模型，答完就结束
+const askedTurn = async ($: Engine, turnId: string) => {
+  await $.turn.start({ text: 'hi', turnId })
+  await stepOf($, turnId, 0)
+  await complete($, turnId)
+}
+
+const lastReceipt = async ($: Engine) => (await footerOf($, 1000)).join('\n')
+
+test('模型闲了 6 分钟缓存没接上：小票写「缓存过期」，明细里说闲了多久，in 标黄', async ($, on) => {
+  const clock = world(on, {}, { steps: [usageOf(0, 100_000), usageOf(20_000, 85_000)] })
+  await start($)
+  await askedTurn($, 't1')
+  expect(await lastReceipt($)).not.toContain('缓存')
+
+  await clock.advance(6 * 60_000)
+  await askedTurn($, 't2')
+  expect(await lastReceipt($)).toContain('缓存过期，重算 85k')
+
+  const ui = await expand($, 120)
+  expect(await hudText(ui)).toContain('模型闲了 6m，缓存多半过期了，85k 上下文重新算了一遍')
+  // 最近的一轮排在最上面，它的 in 是黄的
+  expect(await colorOf(ui, '  10k')).toBe('yellow')
+})
+
+test('缓存接上了、上下文变小了（压缩过）、说不出原因的都不报；换了模型的说换了模型', async ($, on) => {
+  const clock = world(on, {}, {
+    steps: [
+      usageOf(0, 100_000),
+      // 一分钟后，接上了
+      usageOf(100_000, 3_000),
+      // 一分钟后换了模型
+      usageOf(0, 103_000, 'claude-sonnet-5-5'),
+      // 十分钟后，上下文压缩到 30k
+      usageOf(0, 30_000, 'claude-sonnet-5-5'),
+      // 一分钟后没接上，但说不出原因（比如 Claude Code 清掉了旧的工具结果）
+      usageOf(0, 31_000, 'claude-sonnet-5-5'),
+    ],
+  })
+  await start($)
+  await askedTurn($, 't1')
+  await clock.advance(60_000)
+  await askedTurn($, 't2')
+  expect(await lastReceipt($)).not.toContain('缓存')
+  await clock.advance(60_000)
+  await askedTurn($, 't3')
+  expect(await lastReceipt($)).toContain('换了模型，缓存重算 103k')
+  await clock.advance(10 * 60_000)
+  await askedTurn($, 't4')
+  expect(await lastReceipt($)).not.toContain('缓存')
+  await clock.advance(60_000)
+  await askedTurn($, 't5')
+  expect(await lastReceipt($)).not.toContain('缓存')
+})
+
+test('一轮中间一条命令跑了很久，缓存也会过期：重算的加起来，写闲得最久的那次', async ($, on) => {
+  const clock = world(on, {}, { steps: [usageOf(0, 100_000), usageOf(0, 101_000), usageOf(0, 102_000)] })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await stepOf($, 't1', 0)
+  await clock.advance(6 * 60_000)
+  await stepOf($, 't1', 1)
+  await clock.advance(8 * 60_000)
+  await stepOf($, 't1', 2)
+  await complete($, 't1')
+  expect(await lastReceipt($)).toContain('缓存过期，重算 203k')
+
+  const ui = await expand($, 120)
+  expect(await hudText(ui)).toContain('模型闲了 8m，缓存多半过期了，203k 上下文重新算了一遍')
 })

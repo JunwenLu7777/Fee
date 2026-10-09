@@ -6,10 +6,21 @@ import type {
   SessionRateLimit,
   SessionUsage,
   ToolCallResult,
+  TurnUsage,
   UiPressArgument,
 } from 'claude-code'
 
-import type { HudActivity, HudDaily, HudDiff, HudGit, HudLimit, HudStats, HudTodo, HudTokens } from '../types'
+import type {
+  HudActivity,
+  HudDaily,
+  HudDiff,
+  HudFileEdit,
+  HudGit,
+  HudLimit,
+  HudStats,
+  HudTodo,
+  HudTokens,
+} from '../types'
 
 import { cellWidth, clip, dayKey, formatClock, formatElapsed, formatSpan, formatTokens, formatWhen } from './format'
 import { MIN_ELAPSED_SHARE, alertText, limitWindows } from './forecast'
@@ -26,6 +37,7 @@ import {
   SHELL_TOOLS,
   addUsage,
   bump,
+  cacheMissOf,
   callLabel,
   compactForecast,
   costSince,
@@ -35,6 +47,7 @@ import {
   emptyReceipt,
   isFailed,
   matchTurn,
+  promptOf,
   pushCall,
   pushTurn,
   relativePath,
@@ -42,6 +55,7 @@ import {
   toTurn,
   withAgentRun,
   withAgentTool,
+  withCacheMiss,
   withCommand,
   withEdit,
   withLastContext,
@@ -86,10 +100,11 @@ const compactAt = atom({ plugin: 'hud', key: 'compactAt' } as const, null)
 const contextParts = atom({ plugin: 'hud', key: 'contextParts' } as const, null)
 const sessionFiles = atom({ plugin: 'hud', key: 'sessionFiles' } as const, [])
 const lastTree = atom({ plugin: 'hud', key: 'lastTree' } as const, null)
-const changesView = atom({ plugin: 'hud', key: 'changesView' } as const, { path: null, page: 0 })
+const changesView = atom({ plugin: 'hud', key: 'changesView' } as const, { path: null, page: 0, turn: null })
 const fileDiff = atom({ plugin: 'hud', key: 'fileDiff' } as const, null)
 // 改动侧边栏摆出来了没有：没摆出来时 HUD 右边才放「◂ 改动」；以引擎记的为准，隔几秒对一次
 const isChangesUp = atom({ plugin: 'hud', key: 'isChangesUp' } as const, false)
+const lastStep = atom({ plugin: 'hud', key: 'lastStep' } as const, null)
 
 const HIDDEN_KEY = 'isHidden'
 // 改动侧边栏：你亲手关掉过就记下，下次启动不再自己打开
@@ -801,21 +816,22 @@ const measureChanges = async ($: EngineInterface) => {
     if (files) {
       await update($, diff, () => sumLines(files))
       await update($, sessionFiles, () => [...files].sort((x, y) => x.path.localeCompare(y.path)))
-      const previous = await read($, lastTree)
-      await update($, lastTree, () => snap.tree)
-      // 工作区变了，侧边栏里点开的那个文件重新读
-      if (previous !== snap.tree && (await read($, changesView)).path) {
-        await loadFileDiff($)
-      }
     }
   }
+  // 小票里改的文件和比出它们的那张快照一起记，侧边栏按轮看时比的就是这两张
   if (a && turnBase) {
     const files = await diffTrees($, turnBase, snap)
     if (files) {
       await update($, activity, x =>
-        x?.isRunning && x.turnId === a.turnId ? { ...x, receipt: { ...x.receipt, files } } : x,
+        x?.isRunning && x.turnId === a.turnId ? { ...x, receipt: { ...x.receipt, files }, treeAtEnd: snap.tree } : x,
       )
     }
+  }
+  const previous = await read($, lastTree)
+  await update($, lastTree, () => snap.tree)
+  // 工作区变了，侧边栏里点开的那个文件重新读
+  if (previous !== snap.tree && (await read($, changesView)).path) {
+    await loadFileDiff($)
   }
 }
 
@@ -838,7 +854,50 @@ const refreshChanges = ($: EngineInterface) => {
   return changesRun
 }
 
-// 侧边栏里点开的文件：会话开始到最近一张快照改了什么。只留改动本身（@@ 起），太长的截掉
+// 侧边栏看的是哪一段：整个会话（会话开始 → 最近一张快照），或者某一轮（那一轮开始 → 结束，还在跑的到最近一张）
+type ChangesRange = {
+  from: string | null
+  to: string | null
+  files: readonly HudFileEdit[]
+  // 按轮看时是哪一轮；看整个会话、或者那一轮已经不在记录里了，为 null
+  turn: { id: string; label: string; isRunning: boolean } | null
+}
+
+const turnLabel = (index: number | null) => (index != null ? `第 ${index} 轮` : '那一轮')
+
+const rangeOf = async ($: EngineInterface): Promise<ChangesRange> => {
+  const [view, base, last, files, a, log] = await Promise.all([
+    read($, changesView),
+    read($, baseTree),
+    read($, lastTree),
+    read($, sessionFiles),
+    read($, activity),
+    read($, turnLog),
+  ])
+  // 旧版本存的没有 turn
+  const id = view.turn ?? null
+  if (id && a?.isRunning && a.turnId === id) {
+    return {
+      from: a.treeAtStart,
+      to: a.treeAtEnd ?? last,
+      files: a.receipt.files,
+      turn: { id, label: turnLabel(a.index), isRunning: true },
+    }
+  }
+  const t = id ? log.find(x => x.turnId === id) : undefined
+  if (id && t) {
+    return {
+      from: t.treeAtStart ?? null,
+      to: t.treeAtEnd ?? null,
+      files: t.receipt.files,
+      turn: { id, label: turnLabel(t.index), isRunning: false },
+    }
+  }
+
+  return { from: base, to: last, files, turn: null }
+}
+
+// 侧边栏里点开的文件：这一段两张快照之间改了什么。只留改动本身（@@ 起），太长的截掉
 const FILE_DIFF_MAX = 400
 
 const patchLines = (out: string) => {
@@ -848,33 +907,46 @@ const patchLines = (out: string) => {
   return start < 0 ? [] : lines.slice(start).filter((l, i, all) => !(i === all.length - 1 && l === ''))
 }
 
+// 没拍到快照的（这个版本之前记的轮次）不读，侧边栏直接说看不了；git 读不出来（快照被清理了）记下来，别当成没改
 const loadFileDiff = async ($: EngineInterface) => {
-  const [view, base, tree] = await Promise.all([read($, changesView), read($, baseTree), read($, lastTree)])
+  const [view, { from, to }] = await Promise.all([read($, changesView), rangeOf($)])
   const path = view.path
-  if (!path || !base || !tree) {
+  if (!path || !from || !to) {
     await update($, fileDiff, () => null)
 
     return
   }
   const ran = await serially(() =>
     $.process
-      .run(['git', 'diff', '--no-color', '--no-ext-diff', '-U3', base, tree, '--', path], { timeoutMs: SNAPSHOT_TIMEOUT_MS })
+      .run(['git', 'diff', '--no-color', '--no-ext-diff', '-U3', from, to, '--', path], { timeoutMs: SNAPSHOT_TIMEOUT_MS })
       .catch(() => null),
   )
-  const lines = ran?.exitCode === 0 ? patchLines(ran.stdout) : []
+  const isMissing = ran?.exitCode !== 0
+  const lines = ran && !isMissing ? patchLines(ran.stdout) : []
   const kept = lines.slice(0, FILE_DIFF_MAX)
   const before = await read($, fileDiff)
-  await update($, fileDiff, () => ({ path, tree, lines: kept, isCut: lines.length > FILE_DIFF_MAX }))
+  await update($, fileDiff, () => ({ path, base: from, tree: to, lines: kept, isCut: lines.length > FILE_DIFF_MAX, isMissing }))
   // 这一轮又改了它、改动变长变短了，翻到的页就不对了，回到第一页
-  if (before?.path === path && before.lines.length !== kept.length) {
+  if (before?.path === path && before.base === from && before.lines.length !== kept.length) {
     await update($, changesView, v => (v.path === path ? { ...v, page: 0 } : v))
   }
 }
 
 // 点一个文件看它的改动，再点一下收起
 const pickFile = async ($: EngineInterface, path: string) => {
-  const view = await update($, changesView, v => (v.path === path ? { path: null, page: 0 } : { path, page: 0 }))
+  const view = await update($, changesView, v => ({ ...v, path: v.path === path ? null : path, page: 0 }))
   if (view.path) {
+    await loadFileDiff($)
+  }
+}
+
+// 换成看某一轮（null 是整个会话）；那一轮只改了一个文件就直接点开它
+const showScope = async ($: EngineInterface, turnId: string | null) => {
+  await update($, changesView, () => ({ path: null, page: 0, turn: turnId }))
+  const range = await rangeOf($)
+  const only = range.turn && range.files.length === 1 ? (range.files[0]?.path ?? null) : null
+  if (only) {
+    await update($, changesView, v => ({ ...v, path: only }))
     await loadFileDiff($)
   }
 }
@@ -900,8 +972,12 @@ const autoOpenChanges = async ($: EngineInterface) => {
   await syncChanges($)
 }
 
-// 从明细或者 HUD 右边的「◂ 改动」点开：多窄都摆出来，以后启动也照常自己开
-const openChanges = async ($: EngineInterface) => {
+// 从明细或者 HUD 右边的「◂ 改动」点开：多窄都摆出来，以后启动也照常自己开。
+// 从明细里某一轮点开的，侧边栏换成看那一轮；HUD 上点开的照原来看的
+const openChanges = async ($: EngineInterface, turnId?: string) => {
+  if (turnId !== undefined) {
+    await showScope($, turnId)
+  }
   await $.store.set(CHANGES_KEY, 'open')
   const opened = await $.ui.open({ id: CHANGES_PANE, title: '改动' })
   await update($, isChangesUp, () => opened.isPlaced)
@@ -1317,6 +1393,23 @@ const toggleDetails = async ($: EngineInterface) => {
   }
 }
 
+// 主对话这一轮里的一次请求答完了：缓存没接上又说得出原因就记进小票，再记下这次请求给下一次比。
+// 不是这一轮的请求（别的后台请求）不看，免得被当成换了模型
+const noteStep = async ($: EngineInterface, turnId: string, sentAt: number, used: TurnUsage | null) => {
+  const a = await read($, activity)
+  if (!used || !a?.isRunning || a.turnId !== turnId) {
+    return
+  }
+  const miss = cacheMissOf(await read($, lastStep), used, sentAt)
+  if (miss) {
+    await update($, activity, x =>
+      x?.isRunning && x.turnId === turnId ? { ...x, receipt: withCacheMiss(x.receipt, miss) } : x,
+    )
+  }
+  const at = await $.clock.now()
+  await update($, lastStep, () => ({ at, prompt: promptOf(used), model: used.model }))
+}
+
 const tick = async ($: EngineInterface) => {
   const current = await read($, activity)
   if (!current?.isRunning) {
@@ -1366,6 +1459,12 @@ export const register: Register = (on, options) => {
     void refreshFable($)
     void initBaseline($)
       .then(() => autoOpenChanges($))
+      .then(async () => {
+        // 热重载前点开的文件重新读一次：旧版本存的改动没记从哪张快照比起
+        if ((await read($, changesView)).path) {
+          await loadFileDiff($)
+        }
+      })
       .catch(() => undefined)
     void loadDaily($).catch(() => undefined)
     // 热重载时模型没变也估一次，旧版本没记过自动压缩的点
@@ -1396,6 +1495,8 @@ export const register: Register = (on, options) => {
       fails: {},
       edits: {},
       treeAtStart: snap?.tree ?? null,
+      // 还没比过，先和开始时一样：按轮看时是空的，不会拿上一轮结束的样子来比
+      treeAtEnd: snap?.tree ?? null,
       contextAtStart: s?.contextTokens ?? null,
       isCompacted: false,
     }))
@@ -1404,13 +1505,17 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // 每次请求模型时带着实际生效的 effort，/effort 改了这里就跟着变；子 agent 的请求不算
+  // 每次请求模型时带着实际生效的 effort，/effort 改了这里就跟着变；答完了看缓存接没接上。子 agent 的请求不算
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId == null) {
-      await update($, effort, () => (e.effort == null ? null : String(e.effort)))
+    if (e.agentId != null) {
+      return yield* next(e)
     }
+    await update($, effort, () => (e.effort == null ? null : String(e.effort)))
+    const sentAt = await $.clock.now()
+    const done = yield* next(e)
+    await noteStep($, e.turnId, sentAt, done.usage)
 
-    return yield* next(e)
+    return done
   })
 
   on('tool.call', async ($, e, next) => {
@@ -1506,11 +1611,13 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // 主对话这一轮里压缩过，这一轮上下文的涨跌就不算数了（precompute 只是先备好摘要，不算）
+  // 主对话这一轮里压缩过，这一轮上下文的涨跌就不算数了（precompute 只是先备好摘要，不算）；
+  // 压缩后缓存本来就接不上，下一次请求不拿压缩前的比，免得算成缓存过期
   on('session.compact', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId == null && e.trigger !== 'precompute' && !('skip' in done && done.skip)) {
       await update($, activity, a => (a?.isRunning ? { ...a, isCompacted: true } : a))
+      await update($, lastStep, () => null)
     }
 
     return done
@@ -1561,8 +1668,9 @@ export const register: Register = (on, options) => {
     await update($, baseTree, () => null)
     await update($, sessionFiles, () => [])
     await update($, lastTree, () => null)
-    await update($, changesView, () => ({ path: null, page: 0 }))
+    await update($, changesView, () => ({ path: null, page: 0, turn: null }))
     await update($, fileDiff, () => null)
+    await update($, lastStep, () => null)
     await refreshTurns($)
     void initBaseline($).catch(() => undefined)
 
@@ -1582,32 +1690,46 @@ export const register: Register = (on, options) => {
     return { text: hide ? 'HUD 已关闭，输入 /hud 重新打开' : 'HUD 已打开' }
   })
 
-  // 改动侧边栏：会话开始以来改过的文件，● 是这一轮改过的；点一个看它改了什么
+  // 改动侧边栏：会话开始以来改过的文件，● 是这一轮改过的；点一个看它改了什么。也能按轮看，一轮一轮翻
   on('ui.render', { component: 'Pane', requestId: CHANGES_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [base, files, view, shownDiff, a, log] = await Promise.all([
+    const [base, view, shownDiff, a, log, range] = await Promise.all([
       read($, baseTree),
-      read($, sessionFiles),
       read($, changesView),
       read($, fileDiff),
       read($, activity),
       read($, turnLog),
+      rangeOf($),
     ])
-    const turn = a?.isRunning ? a.receipt : log.at(-1)?.receipt
+    const latest = a?.isRunning ? a.receipt : log.at(-1)?.receipt
+    // 所有轮次按先后，还在跑的排最后；上一轮、下一轮只在改过文件的里面找
+    const order = [
+      ...log.map(t => ({ id: t.turnId, hasFiles: t.receipt.files.length > 0 })),
+      ...(a?.isRunning ? [{ id: a.turnId, hasFiles: a.receipt.files.length > 0 }] : []),
+    ]
+    const at = range.turn ? order.findIndex(t => t.id === range.turn?.id) : order.length
+    const prev = order.slice(0, Math.max(0, at)).filter(t => t.hasFiles).at(-1)?.id ?? null
+    const next = range.turn ? (order.slice(at + 1).find(t => t.hasFiles)?.id ?? null) : null
 
     return drawChanges(
       { Box, Text, Button },
       {
         isTracked: base != null,
-        files,
-        turnFiles: new Set((turn?.files ?? []).map(f => f.path)),
+        files: range.files,
+        turnFiles: range.turn ? new Set() : new Set((latest?.files ?? []).map(f => f.path)),
         view,
-        diff: shownDiff,
+        // 读的是别的范围（刚换了轮）就先不画
+        diff: shownDiff && shownDiff.base === range.from ? shownDiff : null,
+        turn: range.turn,
+        canDiff: range.from != null && range.to != null,
+        prev,
+        next,
       },
       { columns: e.props.bodyColumns, rows: e.props.scroll.bodyRows },
       {
         pick: path => void pickFile($, path),
         page: page => void update($, changesView, v => ({ ...v, page })),
+        scope: turnId => void showScope($, turnId),
       },
     )
   })
@@ -1812,7 +1934,7 @@ export const register: Register = (on, options) => {
           refreshDaily: () => void refreshDaily($, true).catch(() => undefined),
           fillPrompt: command => void fillPrompt($, command),
           refreshContext: () => void refreshContext($, true).catch(() => undefined),
-          openChanges: () => void openChanges($).catch(() => undefined),
+          openChanges: turnId => void openChanges($, turnId).catch(() => undefined),
         })
       : null
 

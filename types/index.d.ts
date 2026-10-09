@@ -38,6 +38,8 @@ export type HudActivity = {
   edits: Record<string, number>
   // 这一轮开始时工作区的 git 快照（树的 id）；不是 git 仓库时为 null，小票退回按 Edit / Write 算
   treeAtStart: string | null
+  // 这一轮到现在最近一张快照，小票里改的文件就是拿它和开始时比的；跑完时就是结束时的样子。旧版本记的没有
+  treeAtEnd?: string | null
   // 这一轮开始时上下文有多少 token；这一轮里有没有自动压缩过
   contextAtStart: number | null
   isCompacted: boolean
@@ -70,6 +72,15 @@ export type HudFileEdit = {
   removed: number
 }
 
+// 一轮里模型那边的缓存没接上：模型闲了太久、缓存多半过期了，或者换了模型
+export type HudCacheMiss = {
+  // 重新写进缓存（重新算了一遍）的 token；一轮里不止一次的加起来
+  tokens: number
+  // 没接上之前模型闲了多久（最久的那次）
+  idleMs: number
+  isNewModel: boolean
+}
+
 // 一轮的小票：花了多少、用了多少 token、改了哪些文件、跑了几条命令；子 agent 做的也算进来
 export type HudReceipt = {
   // 这一轮花的：从这一轮开始到下一轮开始之间的花费
@@ -82,6 +93,8 @@ export type HudReceipt = {
   // 失败的命令原文（截到一千字），只留最后几条；明细里点一条放进输入框
   failedCommands: string[]
   agents: number
+  // 缓存没接上就记下；旧版本记的小票没有
+  cacheMiss?: HudCacheMiss | null
 }
 
 // 跑完的一轮
@@ -99,6 +112,16 @@ export type HudTurn = {
   contextAtStart: number | null
   contextAtEnd: number | null
   isCompacted: boolean
+  // 这一轮开始、结束时工作区的 git 快照，侧边栏按轮看改动时比这两张；不是 git 仓库、旧版本记的没有
+  treeAtStart?: string | null
+  treeAtEnd?: string | null
+}
+
+// 主对话上一次请求模型：什么时候答完的、请求一共多少 token、哪个模型答的；拿来看下一次请求缓存接没接上
+export type HudStep = {
+  at: number
+  prompt: number
+  model: string
 }
 
 // 一种工具在本会话里的调用次数和耗时
@@ -187,19 +210,24 @@ export type HudContextParts = {
   deferred: number
 }
 
-// 改动侧边栏里点出来的状态：看哪个文件、它的改动翻到第几页
+// 改动侧边栏里点出来的状态：看整个会话还是某一轮、看哪个文件、它的改动翻到第几页
 export type HudChangesView = {
   path: string | null
   page: number
+  // 按轮看时是哪一轮（turnId）；看整个会话时为 null。旧版本存的没有
+  turn: string | null
 }
 
-// 侧边栏里点开的那个文件改了什么：会话开始到最近一张快照的 git diff，只留前几百行
+// 侧边栏里点开的那个文件改了什么：两张快照之间的 git diff（整个会话是会话开始到最近一张，按轮看是那一轮的开始到结束），只留前几百行
 export type HudFileDiff = {
   path: string
-  // 比的是哪张快照，工作区又变了就重新读
+  // 从哪张快照比到哪张；看的范围变了、工作区又变了就重新读
+  base: string
   tree: string
   lines: string[]
   isCut: boolean
+  // git 读不出来（快照被 git 清理掉了之类）
+  isMissing: boolean
 }
 
 export type HudDetailsTab = 'turns' | 'tools' | 'context' | 'agents' | 'spend'
@@ -275,6 +303,8 @@ declare module 'claude-code' {
       fileDiff: HudFileDiff | null
       // 改动侧边栏开着、而且摆出来了；没摆出来时 HUD 右边才放「◂ 改动」
       isChangesUp: boolean
+      // 主对话上一次请求模型，看下一次缓存接没接上
+      lastStep: HudStep | null
     }
   }
 }

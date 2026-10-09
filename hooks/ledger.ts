@@ -3,10 +3,12 @@ import type { AgentInfo, TurnUsage } from 'claude-code'
 import type {
   HudActivity,
   HudAgent,
+  HudCacheMiss,
   HudDetailsView,
   HudDiff,
   HudFileEdit,
   HudReceipt,
+  HudStep,
   HudTokens,
   HudToolCall,
   HudToolStat,
@@ -47,6 +49,7 @@ export const emptyReceipt = (): HudReceipt => ({
   failed: 0,
   failedCommands: [],
   agents: 0,
+  cacheMiss: null,
 })
 
 export const addUsage = (t: HudTokens | null, u: TurnUsage): HudTokens => ({
@@ -167,6 +170,51 @@ export const withTokens = (r: HudReceipt, u: TurnUsage, isMain: boolean): HudRec
   model: isMain ? u.model : r.model,
 })
 
+// ---------- 缓存接没接上 ----------
+
+// 上一次请求至少这么大才看；这次比上次小了三成以上是压缩或清空过，不算；
+// 比上次少读了这么多缓存（至少 1 万、上一次的三成）才算没接上；模型闲了这么久，缓存多半过期了
+const CACHE_MIN_PROMPT = 20_000
+const CACHE_SHRINK = 0.7
+const CACHE_LOST_MIN = 10_000
+const CACHE_LOST_SHARE = 0.3
+export const CACHE_IDLE_MS = 5 * 60_000
+
+// 一次请求一共多少 token：没缓存的、从缓存读的、写进缓存的
+export const promptOf = (u: TurnUsage) => u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+
+// 主对话这次请求和上一次比，缓存没接上又说得出原因（模型闲太久、换了模型）才算；
+// 别的原因（比如 Claude Code 自己清掉了旧的工具结果）不算，免得常常报
+export const cacheMissOf = (prev: HudStep | null, u: TurnUsage, sentAt: number): HudCacheMiss | null => {
+  if (!prev || prev.prompt < CACHE_MIN_PROMPT || promptOf(u) < prev.prompt * CACHE_SHRINK) {
+    return null
+  }
+  const lost = prev.prompt - u.cache_read_input_tokens
+  if (lost < Math.max(CACHE_LOST_MIN, prev.prompt * CACHE_LOST_SHARE)) {
+    return null
+  }
+  const idleMs = Math.max(0, sentAt - prev.at)
+  const isNewModel = u.model !== prev.model
+
+  return isNewModel || idleMs >= CACHE_IDLE_MS ? { tokens: u.cache_creation_input_tokens, idleMs, isNewModel } : null
+}
+
+// 一轮里没接上不止一次（比如中间一条命令跑了很久）：重算的加起来，闲得最久的那次
+export const withCacheMiss = (r: HudReceipt, miss: HudCacheMiss): HudReceipt => {
+  const before = r.cacheMiss
+
+  return {
+    ...r,
+    cacheMiss: before
+      ? {
+          tokens: before.tokens + miss.tokens,
+          idleMs: Math.max(before.idleMs, miss.idleMs),
+          isNewModel: before.isNewModel || miss.isNewModel,
+        }
+      : miss,
+  }
+}
+
 // 按名字计数：命令失败一次、文件改一次就加一
 export const bump = (counts: Readonly<Record<string, number>>, key: string): Record<string, number> => ({
   ...counts,
@@ -199,6 +247,8 @@ export const toTurn = (
   contextAtStart: a.contextAtStart ?? null,
   contextAtEnd: context,
   isCompacted: a.isCompacted ?? false,
+  treeAtStart: a.treeAtStart ?? null,
+  treeAtEnd: a.treeAtEnd ?? null,
 })
 
 export const pushTurn = (log: readonly HudTurn[], turn: HudTurn): HudTurn[] => [...log, turn].slice(-TURN_LOG_MAX)

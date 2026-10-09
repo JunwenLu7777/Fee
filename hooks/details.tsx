@@ -3,6 +3,7 @@ import type { Elements, RenderElement } from 'claude-code'
 import type {
   HudActivity,
   HudAgent,
+  HudCacheMiss,
   HudContextParts,
   HudDaily,
   HudDetailsTab,
@@ -64,10 +65,22 @@ const commandsPieces = (r: HudReceipt): Piece[] =>
       ]
     : [{ text: `${r.commands} 条命令`, dim: true }]
 
-// $0.27 · 改 a.ts +2 -1 · 5 条命令，1 条失败 · 2 个子 agent；没什么可说的就是空的
+// 缓存没接上，这一轮的花费多半就高在这：换了模型的直说，别的是模型闲太久过期了
+const cacheMissPieces = (m: HudCacheMiss): Piece[] => [
+  { text: m.isNewModel ? `换了模型，缓存重算 ${formatTokens(m.tokens)}` : `缓存过期，重算 ${formatTokens(m.tokens)}`, color: 'yellow' },
+]
+
+// 明细里那一轮下面的一句话
+const cacheMissText = (m: HudCacheMiss) =>
+  m.isNewModel
+    ? `换了模型，缓存接不上，${formatTokens(m.tokens)} 上下文重新算了一遍`
+    : `模型闲了 ${formatSpan(m.idleMs)}，缓存多半过期了，${formatTokens(m.tokens)} 上下文重新算了一遍`
+
+// $0.27 · 缓存过期，重算 85k · 改 a.ts +2 -1 · 5 条命令，1 条失败 · 2 个子 agent；没什么可说的就是空的
 export const receiptPieces = (r: HudReceipt): Piece[] =>
   join([
     ...(r.costUsd != null && r.costUsd >= 0.005 ? [[{ text: formatUsd(r.costUsd), color: 'yellow' }]] : []),
+    ...(r.cacheMiss ? [cacheMissPieces(r.cacheMiss)] : []),
     ...(r.files.length ? [filesPieces(r.files)] : []),
     ...(r.commands ? [commandsPieces(r)] : []),
     ...(r.agents ? [[{ text: `${r.agents} 个子 agent`, dim: true }]] : []),
@@ -113,8 +126,8 @@ export type DetailsActions = {
   fillPrompt: (text: string) => void
   // 点「刷新」马上重新估上下文里装了什么
   refreshContext: () => void
-  // 在侧边栏里看改动
-  openChanges: () => void
+  // 在侧边栏里看这一轮的改动
+  openChanges: (turnId: string) => void
 }
 
 const TABS: { id: HudDetailsTab; label: string }[] = [
@@ -437,7 +450,11 @@ export const drawDetails = (
               width: 5,
               isRight: true,
               sort: 'input' as const,
-              cell: (r: TurnRow) => ({ text: formatTokens(inputOf(r.receipt.tokens)) }),
+              // 缓存没接上的轮次 in 标黄
+              cell: (r: TurnRow) => ({
+                text: formatTokens(inputOf(r.receipt.tokens)),
+                ...(r.receipt.cacheMiss ? { color: 'yellow' } : {}),
+              }),
             },
             {
               title: 'out',
@@ -546,10 +563,11 @@ export const drawDetails = (
             ...(rec.agents ? [['子 agent', `${rec.agents} 个`] as const] : []),
           ]),
         )}
+        {rec.cacheMiss && line([{ text: cacheMissText(rec.cacheMiss), color: 'yellow' }])}
         {rec.files.length > 0 && (
           <Box columnGap={1}>
             {note(`改了 ${rec.files.length} 个文件`)}
-            {link('changes:open', '在侧边栏看 ›', actions.openChanges)}
+            {link('changes:open', '在侧边栏看 ›', () => actions.openChanges(r.turnId))}
           </Box>
         )}
         {files.map(f => line([{ text: `  ${padEnd(f.path, nameWidth)}` }, ...linesPieces(f.added, f.removed)]))}
