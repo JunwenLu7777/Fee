@@ -959,6 +959,18 @@ test('每轮结尾那行下面另起一行写小票：花费、改了哪些文�
   expect(await footerOf($, 60_000)).toEqual(['✻ Baked for 60000ms'])
 })
 
+test('/hud 关掉后小票也不画，打开后照常画', async ($, on) => {
+  world(on)
+  await start($)
+  await oneTurn($)
+
+  await hud($, 'off')
+  expect(await footerOf($, 1000)).toEqual(['✻ Baked for 1000ms'])
+
+  await hud($, 'on')
+  expect(await footerOf($, 1000)).toEqual(['✻ Baked for 1000ms', '  ⎿  $0.27 · 改 a.ts +2 -1 · 2 条命令，1 条失败'])
+})
+
 test('每轮结尾那行是引擎自己画的节点时，接上小票的整行仍能通过校验', async ($, on) => {
   world(on, {}, { isEngineHint: true })
   await start($)

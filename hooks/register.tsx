@@ -1331,7 +1331,7 @@ export const register: Register = (on, options) => {
   // 不接在那行后面：引擎那行占满整行宽，接在后面的字会被挤到最右边折成好几行
   on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
     const line = await next(e)
-    if (e.surface !== 'terminal') {
+    if (e.surface !== 'terminal' || (await read($, isHidden))) {
       return line
     }
     const turn = matchTurn(await read($, turnLog), e.props.durationMs)
